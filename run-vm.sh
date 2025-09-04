@@ -1,27 +1,6 @@
 #!/usr/bin/env bash
-
-
-# Check for dependencies
-# 1 qemu
-#   brew install qemu
-# 2 drive (.raw)
-#   make a raw drive
-#   first time build build with ISO
-#   lauch from raw with qemu presets, changeable from CLI
-# 3 iso
-#   curl image from internet
-
-
-
 set -euo pipefail
 trap 'echo "Error: Script failed at line $LINENO."; exit 1;' ERR
-
-# TODO
-# Usage: ./csm-qemu-setup.sh <project_name>
-# if [ -z "$1" ]; then
-#     echo "Usage: $0 <project_name>"
-#     exit 1
-# fi
 
 # --- Configuration ------------------------------------------------------------
 # The installer ISO
