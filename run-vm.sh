@@ -12,10 +12,15 @@ DISK_SIZE="64G"
 # Hardware configuration
 CPUS=4
 RAM=10G
-NET_IFACE="en0"           # change if your primary NIC is different (check with #ifconfig)
-MAC="52:54:00:12:34:56"   # static MAC so DHCP always gives the same IP
-
-# Full args list
+NET_IFACE="en0"
+MAC="52:54:00:12:34:56"
+# USB Whitelist: Only devices here will be passed to QEMU
+# Format: "vendorid:productid"
+USB_WHITELIST=(
+  "0x090c:0x1000"   # Samsung Flash Drive
+  "0x16d0:0x117e"   # CANable2
+)
+# QEMU base args
 QEMU_ARGS=(
   -machine virt
   -accel hvf
@@ -28,14 +33,16 @@ QEMU_ARGS=(
   -netdev vmnet-bridged,id=net0,ifname=$NET_IFACE
   -nographic
   -serial "mon:stdio"
+  -device qemu-xhci,id=xhci
 )
 
-# --- Handle disk creation  if necessar ----------------------------------------
+# --- Handle disk creation if necessary ----------------------------------------
 if [ ! -f $DISK_FILE ]; then
+  # Create disk file
   echo "Creating raw disk $DISK_FILE ($DISK_SIZE)..."
   qemu-img create -f raw $DISK_FILE $DISK_SIZE
 
-  # --- Find or fetch Ubuntu Server ARM64 ISO ----------------------------------
+  # Find or fetch Ubuntu Server ARM64 ISO
   ISO_FILE="$(ls ubuntu*.iso 2>/dev/null | head -n 1 || true)"
 
   if [ -z "${ISO_FILE:-}" ]; then
@@ -51,10 +58,47 @@ if [ ! -f $DISK_FILE ]; then
     fi
   fi
 
-  echo "Using ISO: $ISO_FILE"
-
-  # --- Sets the ISO as the instalation media for the VM
+  # Sets the ISO as the instalation media for the VM
   QEMU_ARGS+=( -drive "file=${ISO_FILE},media=cdrom,if=virtio" )
+  echo "Using ISO: $ISO_FILE"
+else
+  # Parse system_profiler and add only whitelisted USB devices
+  USB_DEVICES=($(system_profiler SPUSBDataType 2>/dev/null | awk '
+    /^[[:space:]]+[^\t].*:$/ {
+      # Device name lines (indented, ending with colon)
+      device=$0
+      sub(/^[[:space:]]+/, "", device)
+      sub(/:$/, "", device)
+    }
+    /Product ID:/ {
+      match($0, /0x[0-9a-fA-F]+/)
+      if (RSTART > 0) {
+        prod = substr($0, RSTART, RLENGTH)
+      }
+    }
+    /Vendor ID:/ {
+      match($0, /0x[0-9a-fA-F]+/)
+      if (RSTART > 0) {
+        vend = substr($0, RSTART, RLENGTH)
+      }
+      if (device != "" && prod != "" && vend != "") {
+        printf "%s:%s\n", vend, prod
+        device=""; prod=""; vend=""
+      }
+    }'))
+  for DEV in "${USB_DEVICES[@]}"; do
+    for WHITELISTED in "${USB_WHITELIST[@]}"; do
+      if [ "$DEV" = "$WHITELISTED" ]; then
+          VID=$(echo "$DEV" | cut -d: -f1)
+          PID=$(echo "$DEV" | cut -d: -f2)
+          QEMU_ARGS+=( -device "usb-host,vendorid=${VID},productid=${PID},bus=xhci.0" )
+          # echo "Added USB device $VID:$PID"
+      fi
+    done
+  done
 fi
 
+echo "--- RUNNING QEMU ---"
+echo "qemu-system-aarch64 ${QEMU_ARGS[@]}"
+echo "--------------------"
 exec qemu-system-aarch64 "${QEMU_ARGS[@]}"
