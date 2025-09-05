@@ -1,4 +1,4 @@
 *.iso
 *.raw
 *.qcow2
-test.sh
+test*

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 trap 'echo "Error: Script failed at line $LINENO."; exit 1;' ERR
 
@@ -10,11 +11,12 @@ ISO_NAME="$(basename "$ISO_URL")"
 DISK_FILE="ubuntu24-aarch64.raw"
 DISK_SIZE="64G"
 # Hardware configuration
-CPUS=4
-RAM=10G
+CPUS=6
+RAM=12G
 NET_IFACE="en0"
 MAC="52:54:00:12:34:56"
-# USB Whitelist: Only devices here will be passed to QEMU
+# USB Whitelist: Non-storage USB devices must be whitelisted
+# here to be passed to QEMU. All storage devices are passed by default.
 # Format: "vendorid:productid"
 USB_WHITELIST=(
   "0x090c:0x1000"   # Samsung Flash Drive
@@ -36,15 +38,17 @@ QEMU_ARGS=(
   -device qemu-xhci,id=xhci
 )
 
-# --- Handle disk creation if necessary ----------------------------------------
-if [ ! -f $DISK_FILE ]; then
-  # Create disk file
+
+# --- Functionality ------------------------------------------------------------
+create_disk_file() \
+{
   echo "Creating raw disk $DISK_FILE ($DISK_SIZE)..."
   qemu-img create -f raw $DISK_FILE $DISK_SIZE
+}
 
-  # Find or fetch Ubuntu Server ARM64 ISO
+add_iso_file() \
+{
   ISO_FILE="$(ls ubuntu*.iso 2>/dev/null | head -n 1 || true)"
-
   if [ -z "${ISO_FILE:-}" ]; then
     echo "No Ubuntu ISO found locally. Attempting to download:"
     echo "  $ISO_URL"
@@ -57,12 +61,13 @@ if [ ! -f $DISK_FILE ]; then
       exit 1
     fi
   fi
-
-  # Sets the ISO as the instalation media for the VM
   QEMU_ARGS+=( -drive "file=${ISO_FILE},media=cdrom,if=virtio" )
   echo "Using ISO: $ISO_FILE"
-else
-  # Parse system_profiler and add only whitelisted USB devices
+}
+
+add_usb_devices() \
+{
+  EXTERNAL_DISKS=$(diskutil list | grep "(external, physical)" | awk '{print $1}')
   USB_DEVICES=($(system_profiler SPUSBDataType 2>/dev/null | awk '
     /^[[:space:]]+[^\t].*:$/ {
       # Device name lines (indented, ending with colon)
@@ -86,19 +91,52 @@ else
         device=""; prod=""; vend=""
       }
     }'))
+  DISK_DEVICES=$(system_profiler SPUSBDataType | awk '
+    /Product ID:/ {match($0,/0x[0-9a-fA-F]+/); prod=substr($0,RSTART,RLENGTH)}
+    /Vendor ID:/  {match($0,/0x[0-9a-fA-F]+/); vend=substr($0,RSTART,RLENGTH)}
+    /BSD Name:/   {if(prod && vend){printf "%s:%s %s\n",vend,prod,$3; prod=""; vend=""}}')
+
+  # Add all storage devices as "raw"
+  for DISK in $EXTERNAL_DISKS; do
+    diskutil unmountDisk force $DISK || true
+    QEMU_ARGS+=( -drive "file=$DISK,if=virtio,format=raw" )
+    echo "Added external storage device: $DISK"
+  done
+  # Add whitelisted non-storage devices the other way
   for DEV in "${USB_DEVICES[@]}"; do
+    if echo "$DISK_DEVICES" | grep -q "^$DEV "; then
+      echo "Skipping $DEV as generic USB device (listed as storage)"
+      continue
+    fi
     for WHITELISTED in "${USB_WHITELIST[@]}"; do
       if [ "$DEV" = "$WHITELISTED" ]; then
-          VID=$(echo "$DEV" | cut -d: -f1)
-          PID=$(echo "$DEV" | cut -d: -f2)
-          QEMU_ARGS+=( -device "usb-host,vendorid=${VID},productid=${PID},bus=xhci.0" )
-          # echo "Added USB device $VID:$PID"
+        VID=$(echo "$DEV" | cut -d: -f1)
+        PID=$(echo "$DEV" | cut -d: -f2)
+        QEMU_ARGS+=( -device "usb-host,vendorid=${VID},productid=${PID},bus=xhci.0" )
+        echo "Added USB device $VID:$PID"
       fi
     done
   done
+}
+
+run_qemu() \
+{
+  echo "--- RUNNING QEMU ---"
+  echo "qemu-system-aarch64 ${QEMU_ARGS[@]}"
+  echo "--------------------"
+  exec sudo qemu-system-aarch64 "${QEMU_ARGS[@]}"
+}
+
+
+# --- Main Logic ---------------------------------------------------------------
+if [ ! -f $DISK_FILE ]; then
+  # Create disk file
+  create_disk_file
+  # Find or fetch Ubuntu Server ARM64 ISO and add to VM
+  add_iso_file
+else
+  # Non-init run -- add usb devices
+  add_usb_devices
 fi
 
-echo "--- RUNNING QEMU ---"
-echo "qemu-system-aarch64 ${QEMU_ARGS[@]}"
-echo "--------------------"
-exec qemu-system-aarch64 "${QEMU_ARGS[@]}"
+run_qemu
