@@ -67,7 +67,7 @@ add_iso_file() \
 
 add_usb_devices() \
 {
-  EXTERNAL_DISKS=$(diskutil list | grep "(external, physical)" | awk '{print $1}')
+  EXTERNAL_DISKS=$(diskutil list | grep "(external, physical)" | awk '{print $1}' || true)
   USB_DEVICES=($(system_profiler SPUSBDataType 2>/dev/null | awk '
     /^[[:space:]]+[^\t].*:$/ {
       # Device name lines (indented, ending with colon)
@@ -90,7 +90,7 @@ add_usb_devices() \
         printf "%s:%s\n", vend, prod
         device=""; prod=""; vend=""
       }
-    }'))
+    }' || true))
   DISK_DEVICES=$(system_profiler SPUSBDataType | awk '
     /Product ID:/ {match($0,/0x[0-9a-fA-F]+/); prod=substr($0,RSTART,RLENGTH)}
     /Vendor ID:/  {match($0,/0x[0-9a-fA-F]+/); vend=substr($0,RSTART,RLENGTH)}
@@ -103,6 +103,7 @@ add_usb_devices() \
     echo "Added external storage device: $DISK"
   done
   # Add whitelisted non-storage devices the other way
+  USB_DEVICES=("${USB_DEVICES[@]:-}")
   for DEV in "${USB_DEVICES[@]}"; do
     if echo "$DISK_DEVICES" | grep -q "^$DEV "; then
       echo "Skipping $DEV as generic USB device (listed as storage)"
