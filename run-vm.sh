@@ -21,6 +21,7 @@ MAC="52:54:00:12:34:56"
 USB_WHITELIST=(
   "0x090c:0x1000"   # Samsung Flash Drive
   "0x16d0:0x117e"   # CANable2
+  "0x045e:0x0b12"
 )
 # QEMU base args
 QEMU_ARGS=(
