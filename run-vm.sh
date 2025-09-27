@@ -17,6 +17,7 @@ DISK_FILE_PATH="$SCRIPTPATH/$DISK_FILE"
 # Hardware configuration
 CPUS=6
 RAM=12G
+NET_MODE="bridged"
 NET_IFACE="en0"
 MAC="52:54:00:12:34:56"
 # Socket for calling shutdown
@@ -39,7 +40,6 @@ QEMU_ARGS=(
   -drive "if=pflash,format=raw,file=/opt/homebrew/share/qemu/edk2-aarch64-code.fd,readonly=on"
   -drive "file=${DISK_FILE_PATH},if=virtio,format=raw"
   -device virtio-net-pci,netdev=net0,mac=$MAC
-  -netdev vmnet-bridged,id=net0,ifname=$NET_IFACE
   -device qemu-xhci,id=xhci
   -monitor unix:${MONITOR_SOCKET},server,nowait
 )
@@ -127,6 +127,15 @@ add_usb_devices() \
   done
 }
 
+add_networking() \
+{
+  if [ "$NET_MODE" = "wifi" ]; then
+    QEMU_ARGS+=( -netdev vmnet-shared,id=net0 )
+  else
+    QEMU_ARGS+=( -netdev vmnet-bridged,id=net0,ifname=$NET_IFACE )
+  fi
+}
+
 
 # --- Execution Modes ----------------------------------------------------------
 run_terminal() \
@@ -167,15 +176,27 @@ if [ $MODE = "--help" ]; then
   echo -e "Usage: run-vm.sh <OPTION>"\
     "\nOPTIONS:"\
     "\n --help     : Print this help message."\
+    "\n --wifi     : Use Wi-Fi (vmnet-shared) instead of bridged networking."\
     "\n --startd   : Start VM in headless daemon mode."\
     "\n --stopd    : Attempt to shutdown a headless daemon VM."\
     "\n --restartd : Attempt to restart a headless daemon VM."\
     "\nRunning with no options runs the VM with a terminal attached to the current session."
-elif [ ! -f $DISK_FILE_PATH ]; then
+  exit 0
+fi
+
+# Handle wifi flag
+if [ "$MODE" = "--wifi" ]; then
+  NET_MODE="wifi"
+  MODE="default"
+fi
+
+if [ ! -f $DISK_FILE_PATH ]; then
   # Create disk file
   create_disk_file
   # Find or fetch Ubuntu Server ARM64 ISO and add to VM
   add_iso_file
+  # Add networking
+  add_networking
   # Run in terminal mode so user can configure install
   run_terminal
 else
@@ -184,6 +205,7 @@ else
     --startd)
       # Start daemon
       add_usb_devices
+      add_networking
       run_daemon
       ;;
     --stopd)
@@ -195,11 +217,13 @@ else
       run_shutdown
       sleep 3
       add_usb_devices
+      add_networking
       run_daemon
       ;;
     *)
       # Default behavior -- run terminal session
       add_usb_devices
+      add_networking
       run_terminal
       ;;
   esac
