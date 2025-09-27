@@ -39,7 +39,6 @@ QEMU_ARGS=(
   -m "$RAM"
   -drive "if=pflash,format=raw,file=/opt/homebrew/share/qemu/edk2-aarch64-code.fd,readonly=on"
   -drive "file=${DISK_FILE_PATH},if=virtio,format=raw"
-  -device virtio-net-pci,netdev=net0,mac=$MAC
   -device qemu-xhci,id=xhci
   -monitor unix:${MONITOR_SOCKET},server,nowait
 )
@@ -129,10 +128,17 @@ add_usb_devices() \
 
 add_networking() \
 {
+  # Configure netdev based on NET_MODE. The virtio-net-pci device is added
+  # here so we can decide whether to pass a bridged interface (Ethernet)
+  # or use vmnet-shared (Wi-Fi). When using wifi we must NOT pass the
+  # bridged ifname or any host interface.
   if [ "$NET_MODE" = "wifi" ]; then
     QEMU_ARGS+=( -netdev vmnet-shared,id=net0 )
+    # Attach virtio-net-pci to the net0 backend
+    QEMU_ARGS+=( -device virtio-net-pci,netdev=net0,mac=$MAC )
   else
     QEMU_ARGS+=( -netdev vmnet-bridged,id=net0,ifname=$NET_IFACE )
+    QEMU_ARGS+=( -device virtio-net-pci,netdev=net0,mac=$MAC )
   fi
 }
 
