@@ -18,12 +18,13 @@ DISK_FILE_PATH="$SCRIPTPATH/$DISK_FILE"
 CPUS=6
 RAM=12G
 NET_MODE="bridged"
-NET_IFACE="en0"
+ETH_IFACE="en0"
 MAC="52:54:00:12:34:56"
 # Socket for calling shutdown
 MONITOR_SOCKET="/tmp/qemu-monitor.sock"
 # USB Whitelist: Non-storage USB devices must be whitelisted
-# here to be passed to QEMU. All storage devices are passed by default.
+# here to be passed to QEMU. Use `system_profiler SPUSBDataType` to list
+# devices and find vendor/product id.
 # Format: "vendorid:productid"
 USB_WHITELIST=(
   "0x090c:0x1000"   # Samsung Flash Drive
@@ -39,8 +40,7 @@ QEMU_ARGS=(
   -m "$RAM"
   -drive "if=pflash,format=raw,file=/opt/homebrew/share/qemu/edk2-aarch64-code.fd,readonly=on"
   -drive "file=${DISK_FILE_PATH},if=virtio,format=raw"
-  -device qemu-xhci,id=xhci
-  -monitor unix:${MONITOR_SOCKET},server,nowait
+  -monitor "unix:${MONITOR_SOCKET},server,nowait"
 )
 
 
@@ -108,6 +108,10 @@ add_usb_devices() \
     QEMU_ARGS+=( -drive "file=$DISK,if=virtio,format=raw" )
     echo "Added external storage device: $DISK"
   done
+
+  # Add usb controller
+  QEMU_ARGS+=( -device qemu-xhci,id=xhci )
+
   # Add whitelisted non-storage devices the other way
   USB_DEVICES=("${USB_DEVICES[@]:-}")
   for DEV in "${USB_DEVICES[@]}"; do
@@ -134,11 +138,11 @@ add_networking() \
   # bridged ifname or any host interface.
   if [ "$NET_MODE" = "wifi" ]; then
     QEMU_ARGS+=( -netdev vmnet-shared,id=net0 )
+    QEMU_ARGS+=( -device "virtio-net-pci,netdev=net0,mac=$MAC" )
     # Attach virtio-net-pci to the net0 backend
-    QEMU_ARGS+=( -device virtio-net-pci,netdev=net0,mac=$MAC )
   else
-    QEMU_ARGS+=( -netdev vmnet-bridged,id=net0,ifname=$NET_IFACE )
-    QEMU_ARGS+=( -device virtio-net-pci,netdev=net0,mac=$MAC )
+    QEMU_ARGS+=( -netdev "vmnet-bridged,id=net0,ifname=$ETH_IFACE" )
+    QEMU_ARGS+=( -device "virtio-net-pci,netdev=net0,mac=$MAC" )
   fi
 }
 
@@ -210,8 +214,8 @@ else
   case "$MODE" in
     --startd)
       # Start daemon
-      add_usb_devices
       add_networking
+      add_usb_devices
       run_daemon
       ;;
     --stopd)
@@ -222,14 +226,14 @@ else
       # Call shutdown then start daemon
       run_shutdown
       sleep 3
-      add_usb_devices
       add_networking
+      add_usb_devices
       run_daemon
       ;;
     *)
       # Default behavior -- run terminal session
-      add_usb_devices
       add_networking
+      add_usb_devices
       run_terminal
       ;;
   esac
