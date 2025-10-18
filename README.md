@@ -2,6 +2,7 @@
 1. USB Storage support may require running the script non-headless at least once to spawn the "full disk access" popup.
 
 ### Autostart
+*This doesn't actually seem to work! :(*
 1. Create a new file `/Launch/LaunchDeamons/com.example.ubuntu-vm.plist`:
     ```plist
     <?xml version="1.0" encoding="UTF-8"?>
@@ -50,3 +51,14 @@
         ```bash
         sudo launchctl unload /Library/LaunchDaemons/com.example.ubuntu-vm.plist
         ```
+
+### Useful QEMU Commands
+1. Check overlay integrity:
+    ```bash
+    qemu-img check ubuntu24-aarch64-overlay.qcow2
+    ```
+2. Manually commit VM overlay (in case of logic failure):
+    ```bash
+    qemu-img commit ubuntu24-aarch64-overlay.qcow2
+    rm -f ubuntu24-aarch64-overlay.qcow2
+    ```

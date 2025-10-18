@@ -11,9 +11,12 @@ SCRIPTPATH=$(dirname "$SCRIPT")
 ISO_URL="https://cdimage.ubuntu.com/ubuntu/releases/24.04/release/ubuntu-24.04.3-live-server-arm64.iso"
 ISO_NAME="$(basename "$ISO_URL")"
 # The VM storage disk (file)
-DISK_FILE="ubuntu24-aarch64.raw"
+BASE_DISK_FILE="ubuntu24-aarch64-base.qcow2"
+OVERLAY_DISK_FILE="ubuntu24-aarch64-overlay.qcow2"
+BASE_DISK_PATH="$SCRIPTPATH/$BASE_DISK_FILE"
+OVERLAY_DISK_PATH="$SCRIPTPATH/$OVERLAY_DISK_FILE"
 DISK_SIZE="64G"
-DISK_FILE_PATH="$SCRIPTPATH/$DISK_FILE"
+DISK_CACHE_MODE="none"
 # Hardware configuration
 CPUS=6
 RAM=12G
@@ -39,16 +42,40 @@ QEMU_ARGS=(
   -smp "cpus=${CPUS},sockets=1,cores=${CPUS},threads=1"
   -m "$RAM"
   -drive "if=pflash,format=raw,file=/opt/homebrew/share/qemu/edk2-aarch64-code.fd,readonly=on"
-  -drive "file=${DISK_FILE_PATH},if=virtio,format=raw"
   -monitor "unix:${MONITOR_SOCKET},server,nowait"
 )
 
 
 # --- Functionality ------------------------------------------------------------
-create_disk_file() \
+create_and_use_disk_file() \
 {
-  echo "Creating raw disk $DISK_FILE_PATH ($DISK_SIZE)..."
-  qemu-img create -f raw $DISK_FILE_PATH $DISK_SIZE
+  # Create base qcow2 image instead of raw to support read only base + overlay
+  echo "Creating base QCOW2 disk $BASE_DISK_PATH ($DISK_SIZE)..."
+  qemu-img create -f qcow2 "$BASE_DISK_PATH" "$DISK_SIZE"
+
+  # Use base disk directly for installation
+  QEMU_ARGS+=( -drive "file=${BASE_DISK_PATH},if=virtio,format=qcow2,cache=${DISK_CACHE_MODE}" )
+}
+
+# Create or reuse overlay if it already exists
+create_or_reuse_overlay() \
+{
+  if [ -f "$OVERLAY_DISK_PATH" ]; then
+    echo "Found existing overlay: $OVERLAY_DISK_PATH. Checking integrity..."
+    if qemu-img check "$OVERLAY_DISK_PATH" >/dev/null 2>&1; then
+      echo "Overlay OK. Reusing."
+    else
+      echo "Overlay corrupted. Removing and creating new overlay."
+      rm -f "$OVERLAY_DISK_PATH"
+      qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
+    fi
+  else
+    echo "Creating new overlay for this session..."
+    qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
+  fi
+
+  # Add to QEMU_ARGS dynamically
+  QEMU_ARGS+=( -drive "file=${OVERLAY_DISK_PATH},if=virtio,format=qcow2,cache=${DISK_CACHE_MODE}" )
 }
 
 add_iso_file() \
@@ -146,6 +173,19 @@ add_networking() \
   fi
 }
 
+commit_overlay() \
+{
+  if [ -f "$OVERLAY_DISK_PATH" ]; then
+    echo "Committing overlay to base..."
+    if qemu-img commit "$OVERLAY_DISK_PATH"; then
+      echo "Overlay committed successfully."
+      rm -f "$OVERLAY_DISK_PATH"
+    else
+      echo "Warning: commit failed; overlay preserved for manual recovery."
+    fi
+  fi
+}
+
 
 # --- Execution Modes ----------------------------------------------------------
 run_terminal() \
@@ -155,7 +195,10 @@ run_terminal() \
   echo "--- RUNNING QEMU (TERMINAL) ---"
   echo "qemu-system-aarch64 ${QEMU_ARGS[@]}"
   echo "--------------------"
-  exec sudo qemu-system-aarch64 "${QEMU_ARGS[@]}"
+  
+  sudo qemu-system-aarch64 "${QEMU_ARGS[@]}"
+
+  commit_overlay
 }
 
 run_daemon() \
@@ -173,6 +216,14 @@ run_shutdown() \
 {
   if [ -S "$MONITOR_SOCKET" ]; then
     echo "system_powerdown" | sudo socat - UNIX-CONNECT:"$MONITOR_SOCKET" || true
+
+    # Wait until QEMU process using this overlay exits
+    echo "Waiting for VM to exit..."
+    while pgrep -f "qemu-system-aarch64.*${OVERLAY_DISK_PATH}" >/dev/null; do
+      sleep 1
+    done
+
+    commit_overlay
   else
     echo "No monitor socket found ($MONITOR_SOCKET)"
   fi
@@ -200,9 +251,9 @@ if [ "$MODE" = "--wifi" ]; then
   MODE="default"
 fi
 
-if [ ! -f $DISK_FILE_PATH ]; then
-  # Create disk file
-  create_disk_file
+if [ ! -f "$BASE_DISK_PATH" ]; then
+  # Create base disk file
+  create_and_use_disk_file
   # Find or fetch Ubuntu Server ARM64 ISO and add to VM
   add_iso_file
   # Add networking
@@ -216,6 +267,7 @@ else
       # Start daemon
       add_networking
       add_usb_devices
+      create_or_reuse_overlay
       run_daemon
       ;;
     --stopd)
@@ -225,15 +277,16 @@ else
     --restartd)
       # Call shutdown then start daemon
       run_shutdown
-      sleep 3
       add_networking
       add_usb_devices
+      create_or_reuse_overlay
       run_daemon
       ;;
     *)
       # Default behavior -- run terminal session
       add_networking
       add_usb_devices
+      create_or_reuse_overlay
       run_terminal
       ;;
   esac
