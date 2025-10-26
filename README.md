@@ -1,5 +1,6 @@
 ### Notes
 1. USB Storage support may require running the script non-headless at least once to spawn the "full disk access" popup.
+2. Enable/disable low power mode from the command line using `sudo pmset -a lowpowermode 1` (0 for disable)
 
 ### Autostart
 *This doesn't actually seem to work! :(*
