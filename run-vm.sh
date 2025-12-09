@@ -25,14 +25,13 @@ ETH_IFACE="en0"
 MAC="52:54:00:12:34:56"
 # Socket for calling shutdown
 MONITOR_SOCKET="/tmp/qemu-monitor.sock"
-# USB Whitelist: Non-storage USB devices must be whitelisted
-# here to be passed to QEMU. Use `system_profiler SPUSBDataType` to list
-# devices and find vendor/product id.
+# USB Whitelist: Non-storage USB devices must be whitelisted here to be passed to QEMU.
+# Use `system_profiler SPUSBHostDataType` to list devices and find vendor/product id.
 # Format: "vendorid:productid"
 USB_WHITELIST=(
-  "0x090c:0x1000"   # Samsung Flash Drive
   "0x16d0:0x117e"   # CANable2
   "0x045e:0x0b12"   # Xbox controller
+  "0x0bda:0x8153"   # Realtek ethernet adapter
 )
 # QEMU base args
 QEMU_ARGS=(
@@ -101,40 +100,34 @@ add_usb_devices() \
 {
   echo "Scanning USB devices..."
 
-  EXTERNAL_DISKS=$(diskutil list | grep "(external, physical)" | awk '{print $1}' || true)
-  USB_DEVICES=($(system_profiler SPUSBDataType 2>/dev/null | awk '
-    /^[[:space:]]+[^\t].*:$/ {
-      device=$0
-      sub(/^[[:space:]]+/, "", device)
-      sub(/:$/, "", device)
-    }
-    /Product ID:/ {
-      match($0, /0x[0-9a-fA-F]+/)
-      if (RSTART > 0) {
-        prod = substr($0, RSTART, RLENGTH)
-      }
-    }
-    /Vendor ID:/ {
-      match($0, /0x[0-9a-fA-F]+/)
-      if (RSTART > 0) {
-        vend = substr($0, RSTART, RLENGTH)
-      }
-      if (device != "" && prod != "" && vend != "") {
-        printf "%s:%s\n", vend, prod
-        device=""; prod=""; vend=""
-      }
-    }' || true))
-  DISK_DEVICES=$(system_profiler SPUSBDataType | awk '
-    /Product ID:/ {match($0,/0x[0-9a-fA-F]+/); prod=substr($0,RSTART,RLENGTH)}
-    /Vendor ID:/  {match($0,/0x[0-9a-fA-F]+/); vend=substr($0,RSTART,RLENGTH)}
-    /BSD Name:/   {if(prod && vend){printf "%s:%s %s\n",vend,prod,$3; prod=""; vend=""}}')
-
   # Add all storage devices as "raw"
+  EXTERNAL_DISKS=$(diskutil list | grep "(external, physical)" | awk '{print $1}' || true)
   for DISK in $EXTERNAL_DISKS; do
     diskutil unmountDisk force $DISK || true
     QEMU_ARGS+=( -drive "file=$DISK,if=virtio,format=raw" )
     echo "Added external storage device: $DISK"
   done
+
+  USB_DEVICES=($(system_profiler SPUSBHostDataType 2>/dev/null | awk '
+    BEGIN { RS="(\n){2,}"; FS="\n" }
+    {
+        vid=""; pid=""
+
+        for (i=1; i<=NF; i++) {
+            if ($i ~ /Vendor ID:/) {
+                match($i, /0x[0-9a-fA-F]+/)
+                vid = substr($i, RSTART, RLENGTH)
+            }
+            if ($i ~ /Product ID:/) {
+                match($i, /0x[0-9a-fA-F]+/)
+                pid = substr($i, RSTART, RLENGTH)
+            }
+        }
+
+        if (vid && pid)
+            print vid ":" pid
+    }
+    ' || true))
 
   # Add usb controller
   QEMU_ARGS+=( -device qemu-xhci,id=xhci )
@@ -142,10 +135,6 @@ add_usb_devices() \
   # Add whitelisted non-storage devices the other way
   USB_DEVICES=("${USB_DEVICES[@]:-}")
   for DEV in "${USB_DEVICES[@]}"; do
-    if echo "$DISK_DEVICES" | grep -q "^$DEV "; then
-      echo "Skipping $DEV as generic USB device (listed as storage)"
-      continue
-    fi
     for WHITELISTED in "${USB_WHITELIST[@]}"; do
       if [ "$DEV" = "$WHITELISTED" ]; then
         VID=$(echo "$DEV" | cut -d: -f1)
