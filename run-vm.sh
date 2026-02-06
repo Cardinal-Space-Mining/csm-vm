@@ -32,6 +32,7 @@ USB_WHITELIST=(
   "0x16d0:0x117e"   # CANable2
   "0x045e:0x0b12"   # Xbox controller
   "0x0bda:0x8153"   # Realtek ethernet adapter
+  "0x0e8d:0x7961"   # Brostrend AXE3000
 )
 # QEMU base args
 QEMU_ARGS=(
