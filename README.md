@@ -157,5 +157,17 @@ network:
 * `wlx7419f816b156` is an example wifi adapter and should be renamed or removed accordingly
 * `SSID` and `PASSWORD` should be filled with the target network SSID and password
 
+Ensure the config has the correct permissions:
+```bash
+sudo chmod 600 /etc/netplan/*.yaml
+sudo chown root:root /etc/netplan/*.yaml
+```
+
+Run the following to apply the config:
+```bash
+sudo netplan generate
+sudo netplan apply
+```
+
 > [!CAUTION]
 > There is an issue with Ubuntu/Linux where configuring netplan a certain way and then removing adapters when rebooting will cause a ~90 second delay when booting. There is currently no easy way to fix this for all setups. This will cause issus when setting up the VM with ethernet attached but later using the `--wifi` flag, or setting up external wifi adapters and then removing them.
