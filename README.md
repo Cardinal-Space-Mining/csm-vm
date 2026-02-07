@@ -1,4 +1,6 @@
-This repo contains crucial scripts and documentation for setting up M-series Mac Minis for usage in CSM's robot control pipeline.
+*This repo contains crucial scripts and documentation for setting up M-series Mac Minis for usage in CSM's robot control pipeline.*
+
+#### [Mac Setup](#mac-bringup) | [VM Setup](#virtual-machine-usage)
 
 ## Mac Bringup
 ### Setup
