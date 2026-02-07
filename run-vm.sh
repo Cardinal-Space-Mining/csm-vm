@@ -221,25 +221,29 @@ run_shutdown() \
 
 
 # --- Main Logic ---------------------------------------------------------------
-MODE="${1:-default}"
-
-if [ $MODE = "--help" ]; then
-  echo -e "Usage: run-vm.sh <OPTION>"\
+usage() \
+{
+  echo -e "Usage: run-vm.sh <OPTIONS>"\
     "\nOPTIONS:"\
-    "\n --help     : Print this help message."\
-    "\n --wifi     : Use Wi-Fi (vmnet-shared) instead of bridged networking."\
-    "\n --startd   : Start VM in headless daemon mode."\
-    "\n --stopd    : Attempt to shutdown a headless daemon VM."\
-    "\n --restartd : Attempt to restart a headless daemon VM."\
-    "\nRunning with no options runs the VM with a terminal attached to the current session."
+    "\n --help | -h : Print this help message and immediately exit."\
+    "\n --wifi | -w : Use Wi-Fi (vmnet-shared) instead of bridged networking."\
+    "\n --term      : Run the VM attached to the current terminal session."\
+    "\n --startd    : Run the VM as a headless daemon."\
+    "\n --stopd     : Attempt to shutdown a headless daemon VM."\
+    "\n --restartd  : Attempt to restart a headless daemon VM."\
+    "\nIf no install is detected, a terminal session will be spawned"\
+    "\nto setup the VM regardless of the provided flags."
   exit 0
-fi
+}
 
-# Handle wifi flag
-if [ "$MODE" = "--wifi" ]; then
-  NET_MODE="wifi"
-  MODE="default"
-fi
+MODE="default"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --term | --startd | --stopd | --restartd) MODE="$1"; shift ;;
+    -w | --wifi) NET_MODE="wifi"; shift ;;
+    -h | --help | *) usage ;;
+  esac
+done
 
 if [ ! -f "$BASE_DISK_PATH" ]; then
   # Create base disk file
@@ -272,12 +276,15 @@ else
       create_or_reuse_overlay
       run_daemon
       ;;
-    *)
-      # Default behavior -- run terminal session
+    --term)
+      # Run terminal session
       add_networking
       add_usb_devices
       create_or_reuse_overlay
       run_terminal
+      ;;
+    *)
+      usage
       ;;
   esac
 fi

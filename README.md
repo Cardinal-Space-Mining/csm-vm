@@ -1,6 +1,8 @@
 ### Notes
 1. USB Storage support may require running the script non-headless at least once to spawn the "full disk access" popup.
 2. Enable/disable low power mode from the command line using `sudo pmset -a lowpowermode 1` (0 for disable)
+3. Disable network connection timeout in vm: `sudo systemctl disable systemd-networkd-wait-online.service`
+4. Edit netplan config to setup networking: `sudo nano /etc/netplan/00-installer-config.yaml`
 
 ### Autostart
 *This doesn't actually seem to work! :(*
