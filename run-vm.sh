@@ -11,24 +11,28 @@ SCRIPTPATH=$(dirname "$SCRIPT")
 ISO_URL="https://cdimage.ubuntu.com/ubuntu/releases/24.04/release/ubuntu-24.04.3-live-server-arm64.iso"
 ISO_NAME="$(basename "$ISO_URL")"
 # The VM storage disk (file)
-DISK_FILE="ubuntu24-aarch64.raw"
+BASE_DISK_FILE="ubuntu24-aarch64-base.qcow2"
+OVERLAY_DISK_FILE="ubuntu24-aarch64-overlay.qcow2"
+BASE_DISK_PATH="$SCRIPTPATH/$BASE_DISK_FILE"
+OVERLAY_DISK_PATH="$SCRIPTPATH/$OVERLAY_DISK_FILE"
 DISK_SIZE="64G"
-DISK_FILE_PATH="$SCRIPTPATH/$DISK_FILE"
+DISK_CACHE_MODE="none"
 # Hardware configuration
 CPUS=6
 RAM=12G
 NET_MODE="bridged"
-NET_IFACE="en0"
+ETH_IFACE="en0"
 MAC="52:54:00:12:34:56"
 # Socket for calling shutdown
 MONITOR_SOCKET="/tmp/qemu-monitor.sock"
-# USB Whitelist: Non-storage USB devices must be whitelisted
-# here to be passed to QEMU. All storage devices are passed by default.
+# USB Whitelist: Non-storage USB devices must be whitelisted here to be passed to QEMU.
+# Use `system_profiler SPUSBHostDataType` to list devices and find vendor/product id.
 # Format: "vendorid:productid"
 USB_WHITELIST=(
-  "0x090c:0x1000"   # Samsung Flash Drive
   "0x16d0:0x117e"   # CANable2
   "0x045e:0x0b12"   # Xbox controller
+  "0x0bda:0x8153"   # Realtek ethernet adapter
+  "0x0e8d:0x7961"   # Brostrend AXE3000
 )
 # QEMU base args
 QEMU_ARGS=(
@@ -38,18 +42,40 @@ QEMU_ARGS=(
   -smp "cpus=${CPUS},sockets=1,cores=${CPUS},threads=1"
   -m "$RAM"
   -drive "if=pflash,format=raw,file=/opt/homebrew/share/qemu/edk2-aarch64-code.fd,readonly=on"
-  -drive "file=${DISK_FILE_PATH},if=virtio,format=raw"
-  -device virtio-net-pci,netdev=net0,mac=$MAC
-  -device qemu-xhci,id=xhci
-  -monitor unix:${MONITOR_SOCKET},server,nowait
+  -monitor "unix:${MONITOR_SOCKET},server,nowait"
 )
 
 
 # --- Functionality ------------------------------------------------------------
-create_disk_file() \
+create_and_use_disk_file() \
 {
-  echo "Creating raw disk $DISK_FILE_PATH ($DISK_SIZE)..."
-  qemu-img create -f raw $DISK_FILE_PATH $DISK_SIZE
+  # Create base qcow2 image instead of raw to support read only base + overlay
+  echo "Creating base QCOW2 disk $BASE_DISK_PATH ($DISK_SIZE)..."
+  qemu-img create -f qcow2 "$BASE_DISK_PATH" "$DISK_SIZE"
+
+  # Use base disk directly for installation
+  QEMU_ARGS+=( -drive "file=${BASE_DISK_PATH},if=virtio,format=qcow2,cache=${DISK_CACHE_MODE}" )
+}
+
+# Create or reuse overlay if it already exists
+create_or_reuse_overlay() \
+{
+  if [ -f "$OVERLAY_DISK_PATH" ]; then
+    echo "Found existing overlay: $OVERLAY_DISK_PATH. Checking integrity..."
+    if qemu-img check "$OVERLAY_DISK_PATH" >/dev/null 2>&1; then
+      echo "Overlay OK. Reusing."
+    else
+      echo "Overlay corrupted. Removing and creating new overlay."
+      rm -f "$OVERLAY_DISK_PATH"
+      qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
+    fi
+  else
+    echo "Creating new overlay for this session..."
+    qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
+  fi
+
+  # Add to QEMU_ARGS dynamically
+  QEMU_ARGS+=( -drive "file=${OVERLAY_DISK_PATH},if=virtio,format=qcow2,cache=${DISK_CACHE_MODE}" )
 }
 
 add_iso_file() \
@@ -75,47 +101,41 @@ add_usb_devices() \
 {
   echo "Scanning USB devices..."
 
-  EXTERNAL_DISKS=$(diskutil list | grep "(external, physical)" | awk '{print $1}' || true)
-  USB_DEVICES=($(system_profiler SPUSBDataType 2>/dev/null | awk '
-    /^[[:space:]]+[^\t].*:$/ {
-      device=$0
-      sub(/^[[:space:]]+/, "", device)
-      sub(/:$/, "", device)
-    }
-    /Product ID:/ {
-      match($0, /0x[0-9a-fA-F]+/)
-      if (RSTART > 0) {
-        prod = substr($0, RSTART, RLENGTH)
-      }
-    }
-    /Vendor ID:/ {
-      match($0, /0x[0-9a-fA-F]+/)
-      if (RSTART > 0) {
-        vend = substr($0, RSTART, RLENGTH)
-      }
-      if (device != "" && prod != "" && vend != "") {
-        printf "%s:%s\n", vend, prod
-        device=""; prod=""; vend=""
-      }
-    }' || true))
-  DISK_DEVICES=$(system_profiler SPUSBDataType | awk '
-    /Product ID:/ {match($0,/0x[0-9a-fA-F]+/); prod=substr($0,RSTART,RLENGTH)}
-    /Vendor ID:/  {match($0,/0x[0-9a-fA-F]+/); vend=substr($0,RSTART,RLENGTH)}
-    /BSD Name:/   {if(prod && vend){printf "%s:%s %s\n",vend,prod,$3; prod=""; vend=""}}')
-
   # Add all storage devices as "raw"
+  EXTERNAL_DISKS=$(diskutil list | grep "(external, physical)" | awk '{print $1}' || true)
   for DISK in $EXTERNAL_DISKS; do
     diskutil unmountDisk force $DISK || true
     QEMU_ARGS+=( -drive "file=$DISK,if=virtio,format=raw" )
     echo "Added external storage device: $DISK"
   done
+
+  USB_DEVICES=($(system_profiler SPUSBHostDataType 2>/dev/null | awk '
+    BEGIN { RS="(\n){2,}"; FS="\n" }
+    {
+        vid=""; pid=""
+
+        for (i=1; i<=NF; i++) {
+            if ($i ~ /Vendor ID:/) {
+                match($i, /0x[0-9a-fA-F]+/)
+                vid = substr($i, RSTART, RLENGTH)
+            }
+            if ($i ~ /Product ID:/) {
+                match($i, /0x[0-9a-fA-F]+/)
+                pid = substr($i, RSTART, RLENGTH)
+            }
+        }
+
+        if (vid && pid)
+            print vid ":" pid
+    }
+    ' || true))
+
+  # Add usb controller
+  QEMU_ARGS+=( -device qemu-xhci,id=xhci )
+
   # Add whitelisted non-storage devices the other way
   USB_DEVICES=("${USB_DEVICES[@]:-}")
   for DEV in "${USB_DEVICES[@]}"; do
-    if echo "$DISK_DEVICES" | grep -q "^$DEV "; then
-      echo "Skipping $DEV as generic USB device (listed as storage)"
-      continue
-    fi
     for WHITELISTED in "${USB_WHITELIST[@]}"; do
       if [ "$DEV" = "$WHITELISTED" ]; then
         VID=$(echo "$DEV" | cut -d: -f1)
@@ -129,10 +149,43 @@ add_usb_devices() \
 
 add_networking() \
 {
+  # Configure netdev based on NET_MODE. The virtio-net-pci device is added
+  # here so we can decide whether to pass a bridged interface (Ethernet)
+  # or use vmnet-shared (Wi-Fi). When using wifi we must NOT pass the
+  # bridged ifname or any host interface.
   if [ "$NET_MODE" = "wifi" ]; then
     QEMU_ARGS+=( -netdev vmnet-shared,id=net0 )
+    QEMU_ARGS+=( -device "virtio-net-pci,netdev=net0,mac=$MAC" )
+    # Attach virtio-net-pci to the net0 backend
   else
-    QEMU_ARGS+=( -netdev vmnet-bridged,id=net0,ifname=$NET_IFACE )
+    QEMU_ARGS+=( -netdev "vmnet-bridged,id=net0,ifname=$ETH_IFACE" )
+    QEMU_ARGS+=( -device "virtio-net-pci,netdev=net0,mac=$MAC" )
+  fi
+}
+
+commit_overlay() \
+{
+  if [ -f "$OVERLAY_DISK_PATH" ]; then
+    echo "Committing overlay to base..."
+    if qemu-img commit "$OVERLAY_DISK_PATH"; then
+      echo "Overlay committed successfully."
+      rm -f "$OVERLAY_DISK_PATH"
+    else
+      echo "Warning: commit failed; overlay preserved for manual recovery."
+    fi
+  fi
+}
+
+killall() \
+{
+  PIDS=$(ps aux | grep '[q]emu-system-aarch64' | awk '{print $2}' || true)
+  if [ -n "$PIDS" ]; then
+    echo -e "Killing PID(s): \n$PIDS"
+    kill -9 $PIDS
+    exit 0
+  else
+    echo "No VM processes detected."
+    exit 1
   fi
 }
 
@@ -145,7 +198,10 @@ run_terminal() \
   echo "--- RUNNING QEMU (TERMINAL) ---"
   echo "qemu-system-aarch64 ${QEMU_ARGS[@]}"
   echo "--------------------"
-  exec sudo qemu-system-aarch64 "${QEMU_ARGS[@]}"
+  
+  sudo qemu-system-aarch64 "${QEMU_ARGS[@]}"
+
+  commit_overlay
 }
 
 run_daemon() \
@@ -163,6 +219,14 @@ run_shutdown() \
 {
   if [ -S "$MONITOR_SOCKET" ]; then
     echo "system_powerdown" | sudo socat - UNIX-CONNECT:"$MONITOR_SOCKET" || true
+
+    # Wait until QEMU process using this overlay exits
+    echo "Waiting for VM to exit..."
+    while pgrep -f "qemu-system-aarch64.*${OVERLAY_DISK_PATH}" >/dev/null; do
+      sleep 1
+    done
+
+    commit_overlay
   else
     echo "No monitor socket found ($MONITOR_SOCKET)"
   fi
@@ -170,29 +234,34 @@ run_shutdown() \
 
 
 # --- Main Logic ---------------------------------------------------------------
-MODE="${1:-default}"
-
-if [ $MODE = "--help" ]; then
-  echo -e "Usage: run-vm.sh <OPTION>"\
+usage() \
+{
+  echo -e "Usage: run-vm.sh <OPTIONS>"\
     "\nOPTIONS:"\
-    "\n --help     : Print this help message."\
-    "\n --wifi     : Use Wi-Fi (vmnet-shared) instead of bridged networking."\
-    "\n --startd   : Start VM in headless daemon mode."\
-    "\n --stopd    : Attempt to shutdown a headless daemon VM."\
-    "\n --restartd : Attempt to restart a headless daemon VM."\
-    "\nRunning with no options runs the VM with a terminal attached to the current session."
+    "\n --help | -h : Print this help message and immediately exit."\
+    "\n --wifi | -w : Use Wi-Fi (vmnet-shared) instead of bridged networking."\
+    "\n --term      : Run the VM attached to the current terminal session."\
+    "\n --startd    : Run the VM as a headless daemon."\
+    "\n --stopd     : Attempt to shutdown a headless daemon VM."\
+    "\n --restartd  : Attempt to restart a headless daemon VM."\
+    "\n --fkilld     : Force-kill all VM processes."\
+    "\nIf no install is detected, a terminal session will be spawned"\
+    "\nto setup the VM regardless of the provided flags."
   exit 0
-fi
+}
 
-# Handle wifi flag
-if [ "$MODE" = "--wifi" ]; then
-  NET_MODE="wifi"
-  MODE="default"
-fi
+MODE="default"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --term | --startd | --stopd | --restartd | --fkilld) MODE="$1"; shift ;;
+    -w | --wifi) NET_MODE="wifi"; shift ;;
+    -h | --help | *) MODE="help"; break ;;
+  esac
+done
 
-if [ ! -f $DISK_FILE_PATH ]; then
-  # Create disk file
-  create_disk_file
+if [ ! -f "$BASE_DISK_PATH" ]; then
+  # Create base disk file
+  create_and_use_disk_file
   # Find or fetch Ubuntu Server ARM64 ISO and add to VM
   add_iso_file
   # Add networking
@@ -204,8 +273,9 @@ else
   case "$MODE" in
     --startd)
       # Start daemon
-      add_usb_devices
       add_networking
+      add_usb_devices
+      create_or_reuse_overlay
       run_daemon
       ;;
     --stopd)
@@ -215,16 +285,24 @@ else
     --restartd)
       # Call shutdown then start daemon
       run_shutdown
-      sleep 3
-      add_usb_devices
       add_networking
+      add_usb_devices
+      create_or_reuse_overlay
       run_daemon
       ;;
-    *)
-      # Default behavior -- run terminal session
-      add_usb_devices
+    --term)
+      # Run terminal session
       add_networking
+      add_usb_devices
+      create_or_reuse_overlay
       run_terminal
+      ;;
+    --fkilld)
+      # Kill all VM processes
+      killall
+      ;;
+    *)
+      usage
       ;;
   esac
 fi
