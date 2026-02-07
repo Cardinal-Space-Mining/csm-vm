@@ -176,6 +176,19 @@ commit_overlay() \
   fi
 }
 
+killall() \
+{
+  PIDS=$(ps aux | grep '[q]emu-system-aarch64' | awk '{print $2}' || true)
+  if [ -n "$PIDS" ]; then
+    echo -e "Killing PID(s): \n$PIDS"
+    kill -9 $PIDS
+    exit 0
+  else
+    echo "No VM processes detected."
+    exit 1
+  fi
+}
+
 
 # --- Execution Modes ----------------------------------------------------------
 run_terminal() \
@@ -231,6 +244,7 @@ usage() \
     "\n --startd    : Run the VM as a headless daemon."\
     "\n --stopd     : Attempt to shutdown a headless daemon VM."\
     "\n --restartd  : Attempt to restart a headless daemon VM."\
+    "\n --fkilld     : Force-kill all VM processes."\
     "\nIf no install is detected, a terminal session will be spawned"\
     "\nto setup the VM regardless of the provided flags."
   exit 0
@@ -239,9 +253,9 @@ usage() \
 MODE="default"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --term | --startd | --stopd | --restartd) MODE="$1"; shift ;;
+    --term | --startd | --stopd | --restartd | --fkilld) MODE="$1"; shift ;;
     -w | --wifi) NET_MODE="wifi"; shift ;;
-    -h | --help | *) usage ;;
+    -h | --help | *) MODE="help"; break ;;
   esac
 done
 
@@ -283,6 +297,9 @@ else
       create_or_reuse_overlay
       run_terminal
       ;;
+    --fkilld)
+      # Kill all VM processes
+      killall
     *)
       usage
       ;;
