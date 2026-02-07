@@ -300,6 +300,7 @@ else
     --fkilld)
       # Kill all VM processes
       killall
+      ;;
     *)
       usage
       ;;
