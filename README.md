@@ -129,6 +129,22 @@ Summary (typical usage):
     - net-tools
 
 ### Networking
+To view all available network adapters:
+```bash
+ip link show
+```
+If an adapter isn't immediately available, you may have to manually load the kernel module. Some commands to help determine the device info are:
+* `lsusb`
+* `dmesg | tail -50`
+
+To manually load the kernel module use the following (example for RTL8153 net adapter):
+```bash
+sudo modprobe r8152
+```
+And to permanently load the module on subsequent boots:
+* Create and open the respective module file: `sudo nano /etc/modules-load.d/r8152.conf`
+* Add a single line with the module name: `r8152`
+
 Edit the netplan config using this command:
 ```bash
 sudo nano /etc/netplan/00-installer-config.yaml
