@@ -18,7 +18,7 @@
     ```
 * Install packages using homebrew:
     ```bash
-    brew install git curl qemu btop
+    brew install git curl qemu btop socat
     ```
 * Ensure the following settings are applied:
     - `Prevent automatic sleeping when display is off` : Toggled on
@@ -60,7 +60,10 @@ Mission Control
 
 ## Virtual Machine Usage
 ### Autorun Script / VM Management
-The `run-vm.sh` script manages installing and running the virtual machine. The first time it is run, it will download an Ubuntu server ISO, create a new virtual storage file, and mount the ISO to initialize the Ubuntu install process. Follow the instructions to setup the VM. Once this initial setup process is complete, shutdown the VM and restart it using the typical startup procedure as outlined below.
+The `run-vm.sh` script manages installing and running the virtual machine. The first time it is run, it will download an Ubuntu server ISO, create a new virtual storage file, and mount the ISO to initialize the Ubuntu install process. Follow the instructions to setup the VM. Once this initial setup process is complete, shutdown the VM and restart it using the typical startup procedure as outlined below
+
+> [!TIP]
+> The setup process will go much faster if the mac is connected to ethernet during the initial startup, since this aligns with the default networking config. If not there will be long delays in bootup as linux waits for non-existant networking hardware to become available.
 
 Script usage:
 * Passing `-h`, `--help`, or no CLI args displays a help message and avoids running any other actions.
