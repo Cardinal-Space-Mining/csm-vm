@@ -240,6 +240,19 @@ run_daemon() \
   nohup sudo qemu-system-aarch64 "${QEMU_ARGS[@]}" >/dev/null 2>&1 &
 }
 
+run_launchd() \
+{
+  QEMU_ARGS+=(-display none)
+
+  echo "--- RUNNING QEMU (LAUNCHD) ---"
+  echo "qemu-system-aarch64 ${QEMU_ARGS[@]}"
+  echo "------------------------------"
+
+  qemu-system-aarch64 "${QEMU_ARGS[@]}"
+
+  commit_overlay
+}
+
 run_shutdown() \
 {
   if [ -S "$MONITOR_SOCKET" ]; then
@@ -270,6 +283,7 @@ usage() \
     "\n --stopd      : Attempt to shutdown a headless daemon VM."\
     "\n --restartd   : Attempt to restart a headless daemon VM."\
     "\n --fkilld     : Force-kill all VM processes."\
+    "\n --launchd    : Run the VM in the foreground for use with launchd."\
     "\n --clean      : Commit any pending overlay to base without starting the VM."\
     "\nIf no install is detected, a terminal session will be spawned"\
     "\nto setup the VM regardless of the provided flags."
@@ -287,7 +301,7 @@ verify_not_running() \
 MODE="default"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --term | --startd | --stopd | --restartd | --fkilld | --clean) MODE="$1"; shift ;;
+    --term | --startd | --stopd | --restartd | --fkilld | --clean | --launchd) MODE="$1"; shift ;;
     -w | --wifi) NET_MODE="wifi"; shift ;;
     -h | --help | *) MODE="help"; break ;;
   esac
@@ -330,6 +344,12 @@ else
       add_usb_devices
       create_or_reuse_overlay
       run_terminal
+      ;;
+    --launchd)
+      add_networking
+      add_usb_devices
+      create_or_reuse_overlay
+      run_launchd
       ;;
     --fkilld)
       # Kill all VM processes
