@@ -2,3 +2,4 @@
 *.raw
 *.qcow2
 test*
+machine.conf

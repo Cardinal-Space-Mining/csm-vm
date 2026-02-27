@@ -17,7 +17,7 @@ BASE_DISK_PATH="$SCRIPTPATH/$BASE_DISK_FILE"
 OVERLAY_DISK_PATH="$SCRIPTPATH/$OVERLAY_DISK_FILE"
 DISK_SIZE="64G"
 DISK_CACHE_MODE="none"
-# Hardware configuration
+# Hardware configuration (defaults; may be overridden by machine.conf)
 CPUS=6
 RAM=12G
 NET_MODE="bridged"
@@ -34,7 +34,32 @@ USB_WHITELIST=(
   "0x0bda:0x8153"   # Realtek ethernet adapter
   "0x0e8d:0x7961"   # Brostrend AXE3000
 )
-# QEMU base args
+# Socket for calling shutdown
+MONITOR_SOCKET="/tmp/qemu-monitor.sock"
+
+# --- Load machine config (optional overrides) ---------------------------------
+# Create a machine.conf next to this script to override CPUS, RAM, ETH_IFACE,
+# MAC, and/or USB_WHITELIST. Example machine.conf:
+#
+#   CPUS=4
+#   RAM=8G
+#   ETH_IFACE="en1"
+#   MAC="52:54:00:aa:bb:cc"
+#   USB_WHITELIST=(
+#     "0x16d0:0x117e"
+#     "0x045e:0x0b12"
+#   )
+#
+MACHINE_CONF="${SCRIPTPATH}/machine.conf"
+if [ -f "$MACHINE_CONF" ]; then
+  # echo "Loading machine config: $MACHINE_CONF"
+  # shellcheck source=/dev/null
+  source "$MACHINE_CONF"
+# else
+#   echo "No machine.conf found; using defaults."
+fi
+
+# --- QEMU base args (built after config is loaded) ----------------------------
 QEMU_ARGS=(
   -machine virt
   -accel hvf
@@ -80,7 +105,7 @@ create_or_reuse_overlay() \
 
 add_iso_file() \
 {
-  ISO_FILE="$(ls $SCRIPTPATH/ubuntu*.iso 2>/dev/null | head -n 1 || true)"
+  ISO_FILE="$(ls "$SCRIPTPATH"/ubuntu*.iso 2>/dev/null | head -n 1 || true)"
   if [ -z "${ISO_FILE:-}" ]; then
     echo "No Ubuntu ISO found locally. Attempting to download..."
     echo "  $ISO_URL"
@@ -104,7 +129,7 @@ add_usb_devices() \
   # Add all storage devices as "raw"
   EXTERNAL_DISKS=$(diskutil list | grep "(external, physical)" | awk '{print $1}' || true)
   for DISK in $EXTERNAL_DISKS; do
-    diskutil unmountDisk force $DISK || true
+    diskutil unmountDisk force "$DISK" || true
     QEMU_ARGS+=( -drive "file=$DISK,if=virtio,format=raw" )
     echo "Added external storage device: $DISK"
   done
@@ -133,7 +158,7 @@ add_usb_devices() \
   # Add usb controller
   QEMU_ARGS+=( -device qemu-xhci,id=xhci )
 
-  # Add whitelisted non-storage devices the other way
+  # Add whitelisted non-storage devices
   USB_DEVICES=("${USB_DEVICES[@]:-}")
   for DEV in "${USB_DEVICES[@]}"; do
     for WHITELISTED in "${USB_WHITELIST[@]}"; do
@@ -238,22 +263,31 @@ usage() \
 {
   echo -e "Usage: run-vm.sh <OPTIONS>"\
     "\nOPTIONS:"\
-    "\n --help | -h : Print this help message and immediately exit."\
-    "\n --wifi | -w : Use Wi-Fi (vmnet-shared) instead of bridged networking."\
-    "\n --term      : Run the VM attached to the current terminal session."\
-    "\n --startd    : Run the VM as a headless daemon."\
-    "\n --stopd     : Attempt to shutdown a headless daemon VM."\
-    "\n --restartd  : Attempt to restart a headless daemon VM."\
+    "\n --help | -h  : Print this help message and immediately exit."\
+    "\n --wifi | -w  : Use Wi-Fi (vmnet-shared) instead of bridged networking."\
+    "\n --term       : Run the VM attached to the current terminal session."\
+    "\n --startd     : Run the VM as a headless daemon."\
+    "\n --stopd      : Attempt to shutdown a headless daemon VM."\
+    "\n --restartd   : Attempt to restart a headless daemon VM."\
     "\n --fkilld     : Force-kill all VM processes."\
+    "\n --clean      : Commit any pending overlay to base without starting the VM."\
     "\nIf no install is detected, a terminal session will be spawned"\
     "\nto setup the VM regardless of the provided flags."
   exit 0
+}
+verify_not_running() \
+{
+  # Safety check: refuse to commit if VM appears to be running
+  if pgrep -f "qemu-system-aarch64.*${OVERLAY_DISK_PATH}" >/dev/null; then
+    echo "ERROR: VM appears to be running. Stop it first before committing overlays." >&2
+    exit 1
+  fi
 }
 
 MODE="default"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --term | --startd | --stopd | --restartd | --fkilld) MODE="$1"; shift ;;
+    --term | --startd | --stopd | --restartd | --fkilld | --clean) MODE="$1"; shift ;;
     -w | --wifi) NET_MODE="wifi"; shift ;;
     -h | --help | *) MODE="help"; break ;;
   esac
@@ -300,6 +334,10 @@ else
     --fkilld)
       # Kill all VM processes
       killall
+      ;;
+    --clean)
+      verify_not_running
+      commit_overlay
       ;;
     *)
       usage
