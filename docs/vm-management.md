@@ -54,11 +54,11 @@ The `CPUS`, `RAM`, `ETH_IFACE`, `MAC`, and `USB_WHITELIST` variables may be spec
 ### Script Autostart
 * Use the `autostart.sh` script to initalize the VM to be run on system startup by creating a LaunchDaemon:
     ```bash
-    ./autostart.sh --install
+    sudo ./autostart.sh --install
     ```
 * To disable autostart (unload the LaunchDaemon):
     ```bash
-    ./autostart.sh --uninstall
+    sudo ./autostart.sh --uninstall
     ```
 
 ### Helpful QEMU commands if things are broken:

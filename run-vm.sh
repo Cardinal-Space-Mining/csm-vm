@@ -21,8 +21,10 @@ DISK_CACHE_MODE="none"
 CPUS=6
 RAM=12G
 NET_MODE="bridged"
-ETH_IFACE="en0"
-MAC="52:54:00:12:34:56"
+ETH_IFACE="en0" # this is the MacOS-side interface that get's bridged (ethernet port)
+MAC_BRIDGE="52:54:00:12:34:56"  # the MAC address in the VM tied to the bridged iface
+MAC_HOST="52:54:00:12:34:57"    # the MAC address for the host-to-vm direct iface
+MAC_WIFI="52:54:00:12:34:58"    # the MAC address for shared wifi internet access
 # Socket for calling shutdown
 MONITOR_SOCKET="/tmp/qemu-monitor.sock"
 # USB Whitelist: Non-storage USB devices must be whitelisted here to be passed to QEMU.
@@ -34,17 +36,17 @@ USB_WHITELIST=(
   "0x0bda:0x8153"   # Realtek ethernet adapter
   "0x0e8d:0x7961"   # Brostrend AXE3000
 )
-# Socket for calling shutdown
-MONITOR_SOCKET="/tmp/qemu-monitor.sock"
 
 # --- Load machine config (optional overrides) ---------------------------------
 # Create a machine.conf next to this script to override CPUS, RAM, ETH_IFACE,
-# MAC, and/or USB_WHITELIST. Example machine.conf:
+# MAC_BRIDGE, MAC_HOST, MAC_WIFI, and/or USB_WHITELIST. Example machine.conf:
 #
 #   CPUS=4
 #   RAM=8G
 #   ETH_IFACE="en1"
-#   MAC="52:54:00:aa:bb:cc"
+#   MAC_BRIDGE="52:54:00:aa:bb:cc"
+#   MAC_HOST="52:54:00:aa:bb:cd"
+#   MAC_WIFI="52:54:00:aa:bb:ce"
 #   USB_WHITELIST=(
 #     "0x16d0:0x117e"
 #     "0x045e:0x0b12"
@@ -82,13 +84,42 @@ create_and_use_disk_file() \
   QEMU_ARGS+=( -drive "file=${BASE_DISK_PATH},if=virtio,format=qcow2,cache=${DISK_CACHE_MODE}" )
 }
 
-# Create or reuse overlay if it already exists
+# Create or reuse overlay if it already exists.
+# Pass "interactive" as first arg to prompt the user on leftover overlay detection.
 create_or_reuse_overlay() \
 {
+  local mode="${1:-interactive}"
+
   if [ -f "$OVERLAY_DISK_PATH" ]; then
     echo "Found existing overlay: $OVERLAY_DISK_PATH. Checking integrity..."
     if qemu-img check "$OVERLAY_DISK_PATH" >/dev/null 2>&1; then
-      echo "Overlay OK. Reusing."
+      echo "Overlay OK."
+      if [ "$mode" = "interactive" ]; then
+        echo "An uncommitted overlay from a previous session was detected."
+        echo "  [c] Commit to base and start fresh"
+        echo "  [r] Reuse as-is (resume from previous state)"
+        echo "  [d] Discard and start fresh"
+        read -rp "Choice [c/r/d]: " OVERLAY_CHOICE
+        case "$OVERLAY_CHOICE" in
+          c|C)
+            commit_overlay
+            qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
+            ;;
+          d|D)
+            echo "Discarding overlay..."
+            rm -f "$OVERLAY_DISK_PATH"
+            qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
+            ;;
+          *)
+            echo "Reusing existing overlay."
+            ;;
+        esac
+      else
+        # Non-interactive (launchd): discard and start fresh
+        echo "WARNING: Uncommitted overlay detected from a previous session. Discarding."
+        rm -f "$OVERLAY_DISK_PATH"
+        qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
+      fi
     else
       echo "Overlay corrupted. Removing and creating new overlay."
       rm -f "$OVERLAY_DISK_PATH"
@@ -174,17 +205,18 @@ add_usb_devices() \
 
 add_networking() \
 {
-  # Configure netdev based on NET_MODE. The virtio-net-pci device is added
-  # here so we can decide whether to pass a bridged interface (Ethernet)
-  # or use vmnet-shared (Wi-Fi). When using wifi we must NOT pass the
-  # bridged ifname or any host interface.
+  # Always bridge the ethernet interface so the VM is visible on the LAN
+  QEMU_ARGS+=( -netdev "vmnet-bridged,id=net0,ifname=$ETH_IFACE" )
+  QEMU_ARGS+=( -device "virtio-net-pci,netdev=net0,mac=$MAC_BRIDGE" )
+
+  # Always add a host-only interface for direct host<->VM SSH
+  QEMU_ARGS+=( -netdev "vmnet-host,id=net1" )
+  QEMU_ARGS+=( -device "virtio-net-pci,netdev=net1,mac=$MAC_HOST" )
+
+  # Optionally add vmnet-shared for internet access over WiFi
   if [ "$NET_MODE" = "wifi" ]; then
-    QEMU_ARGS+=( -netdev vmnet-shared,id=net0 )
-    QEMU_ARGS+=( -device "virtio-net-pci,netdev=net0,mac=$MAC" )
-    # Attach virtio-net-pci to the net0 backend
-  else
-    QEMU_ARGS+=( -netdev "vmnet-bridged,id=net0,ifname=$ETH_IFACE" )
-    QEMU_ARGS+=( -device "virtio-net-pci,netdev=net0,mac=$MAC" )
+    QEMU_ARGS+=( -netdev "vmnet-shared,id=net2" )
+    QEMU_ARGS+=( -device "virtio-net-pci,netdev=net2,mac=$MAC_WIFI" )
   fi
 }
 
@@ -277,7 +309,7 @@ usage() \
   echo -e "Usage: run-vm.sh <OPTIONS>"\
     "\nOPTIONS:"\
     "\n --help | -h  : Print this help message and immediately exit."\
-    "\n --wifi | -w  : Use Wi-Fi (vmnet-shared) instead of bridged networking."\
+    "\n --wifi | -w  : Enable Wi-Fi sharing (vmnet-shared)."\
     "\n --term       : Run the VM attached to the current terminal session."\
     "\n --startd     : Run the VM as a headless daemon."\
     "\n --stopd      : Attempt to shutdown a headless daemon VM."\
@@ -289,6 +321,7 @@ usage() \
     "\nto setup the VM regardless of the provided flags."
   exit 0
 }
+
 verify_not_running() \
 {
   # Safety check: refuse to commit if VM appears to be running
@@ -323,7 +356,7 @@ else
       # Start daemon
       add_networking
       add_usb_devices
-      create_or_reuse_overlay
+      create_or_reuse_overlay interactive
       run_daemon
       ;;
     --stopd)
@@ -335,20 +368,20 @@ else
       run_shutdown
       add_networking
       add_usb_devices
-      create_or_reuse_overlay
+      create_or_reuse_overlay interactive
       run_daemon
       ;;
     --term)
       # Run terminal session
       add_networking
       add_usb_devices
-      create_or_reuse_overlay
+      create_or_reuse_overlay interactive
       run_terminal
       ;;
     --launchd)
       add_networking
       add_usb_devices
-      create_or_reuse_overlay
+      create_or_reuse_overlay non-interactive
       run_launchd
       ;;
     --fkilld)
