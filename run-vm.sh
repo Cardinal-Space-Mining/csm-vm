@@ -15,6 +15,8 @@ BASE_DISK_FILE="ubuntu24-aarch64-base.qcow2"
 OVERLAY_DISK_FILE="ubuntu24-aarch64-overlay.qcow2"
 BASE_DISK_PATH="$SCRIPTPATH/$BASE_DISK_FILE"
 OVERLAY_DISK_PATH="$SCRIPTPATH/$OVERLAY_DISK_FILE"
+BASE_DISK_BACKUP_PATH="$SCRIPTPATH/${BASE_DISK_FILE%.qcow2}.backup.qcow2"
+OVERLAY_DISK_BACKUP_PATH="$SCRIPTPATH/${OVERLAY_DISK_FILE%.qcow2}.backup.qcow2"
 DISK_SIZE="64G"
 DISK_CACHE_MODE="none"
 # Hardware configuration (defaults; may be overridden by machine.conf)
@@ -115,14 +117,16 @@ create_or_reuse_overlay() \
             ;;
         esac
       else
-        # Non-interactive (launchd): discard and start fresh
-        echo "WARNING: Uncommitted overlay detected from a previous session. Discarding."
-        rm -f "$OVERLAY_DISK_PATH"
+        # Non-interactive (launchd): save one rolling backup, then start fresh
+        echo "WARNING: Uncommitted overlay detected from a previous session. Saving backup and discarding."
+        mv -f "$OVERLAY_DISK_PATH" "$OVERLAY_DISK_BACKUP_PATH" 2>/dev/null \
+          || { echo "WARNING: Could not save backup; discarding overlay."; rm -f "$OVERLAY_DISK_PATH"; }
         qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
       fi
     else
-      echo "Overlay corrupted. Removing and creating new overlay."
-      rm -f "$OVERLAY_DISK_PATH"
+      echo "Overlay corrupted. Saving backup and creating new overlay."
+      mv -f "$OVERLAY_DISK_PATH" "$OVERLAY_DISK_BACKUP_PATH" 2>/dev/null \
+        || { echo "WARNING: Could not save backup; discarding overlay."; rm -f "$OVERLAY_DISK_PATH"; }
       qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
     fi
   else
@@ -218,6 +222,37 @@ add_networking() \
     QEMU_ARGS+=( -netdev "vmnet-shared,id=net2" )
     QEMU_ARGS+=( -device "virtio-net-pci,netdev=net2,mac=$MAC_WIFI" )
   fi
+}
+
+copy_with_progress() \
+{
+  local src="$1" dst="$2"
+  if command -v pv >/dev/null 2>&1; then
+    pv "$src" > "$dst"
+  else
+    rsync --progress "$src" "$dst"
+  fi
+}
+
+backup_base() \
+{
+  verify_not_running
+  echo "Backing up base disk to $BASE_DISK_BACKUP_PATH..."
+  copy_with_progress "$BASE_DISK_PATH" "$BASE_DISK_BACKUP_PATH"
+  echo "Backup complete."
+}
+
+restore_base() \
+{
+  verify_not_running
+  if [ ! -f "$BASE_DISK_BACKUP_PATH" ]; then
+    echo "ERROR: No backup found at $BASE_DISK_BACKUP_PATH" >&2
+    exit 1
+  fi
+  echo "Restoring base disk from backup..."
+  copy_with_progress "$BASE_DISK_BACKUP_PATH" "$BASE_DISK_PATH"
+  rm -f "$OVERLAY_DISK_PATH"
+  echo "Restore complete. Previous overlay discarded."
 }
 
 commit_overlay() \
@@ -317,6 +352,9 @@ usage() \
     "\n --fkilld     : Force-kill all VM processes."\
     "\n --launchd    : Run the VM in the foreground for use with launchd."\
     "\n --clean      : Commit any pending overlay to base without starting the VM."\
+    "\n --backup     : Copy the base disk to a single backup file (VM must be stopped)."\
+    "\n --restore    : Restore the base disk from the backup file (VM must be stopped)."\
+    "\n --status     : Report whether the VM is currently running."\
     "\nIf no install is detected, a terminal session will be spawned"\
     "\nto setup the VM regardless of the provided flags."
   exit 0
@@ -334,7 +372,7 @@ verify_not_running() \
 MODE="default"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --term | --startd | --stopd | --restartd | --fkilld | --clean | --launchd) MODE="$1"; shift ;;
+    --term | --startd | --stopd | --restartd | --fkilld | --clean | --launchd | --backup | --restore | --status) MODE="$1"; shift ;;
     -w | --wifi) NET_MODE="wifi"; shift ;;
     -h | --help | *) MODE="help"; break ;;
   esac
@@ -391,6 +429,22 @@ else
     --clean)
       verify_not_running
       commit_overlay
+      ;;
+    --backup)
+      backup_base
+      ;;
+    --restore)
+      restore_base
+      ;;
+    --status)
+      PIDS=$(ps aux | grep '[q]emu-system-aarch64' | awk '{print $2}' || true)
+      if [ -n "$PIDS" ]; then
+        echo -e "Ubuntu VM is running. PID(s): \n$PIDS"
+        exit 0
+      else
+        echo "Ubuntu VM is not running."
+        exit 1
+      fi
       ;;
     *)
       usage
