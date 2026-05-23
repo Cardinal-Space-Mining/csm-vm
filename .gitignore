@@ -1,5 +1,6 @@
 *.iso
 *.raw
 *.qcow2
+*.backup
 test*
 machine.conf
