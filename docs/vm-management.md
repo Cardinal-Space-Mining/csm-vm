@@ -7,6 +7,7 @@ The `run-vm.sh` script manages installing and running the virtual machine. The f
 
 Script usage:
 * Passing `-h`, `--help`, or no CLI args displays a help message and avoids running any other actions.
+* The `--status` flag reports whether a VM is currently running.
 * The `--term` flag starts the VM inside the current terminal session. This is useful for modifying networking configs in the VM, which would otherwise cause SSH sessions to disconnect.
 * The `--startd` flag starts the VM in a separate process which gets disconnected from the current terminal session (daemon mode). The only way to interact with the VM in this case is to SSH in.
 * The `--stopd` flag attempts to stop a running daemonized VM and automatically commits overlay changes to the base image.
@@ -14,6 +15,8 @@ Script usage:
 * The `--wifi` flag configures the VM with internet access by sharing the Mac's wifi. This should only be used by macbook users as it is a bit flakey and requires port forwarding for ingoing network traffic.
 * The `--fkilld` flag kills any detected VM processes. Only use this in the case of serious issues.
 * The `--clean` flag cleans up any abandoned overlays by commiting them to the base storage.
+* The `--backup` flag makes a copy of the current base disk file which can be restored later if necessary.
+* The `--restore` flag restores a backup disk file.
 
 Additionally, the script has internal variables that may need to be changed depending on the setup:
 * `ISO_URL` : The URL for the target latest Ubuntu ISO
@@ -70,4 +73,15 @@ The `CPUS`, `RAM`, `ETH_IFACE`, `MAC`, and `USB_WHITELIST` variables may be spec
     ```bash
     qemu-img commit ubuntu24-aarch64-overlay.qcow2
     rm -f ubuntu24-aarch64-overlay.qcow2
+    ```
+
+### Shrinking VM disk usage:
+* Inside the VM, run the following command:
+    ```bash
+    dd if=/dev/zero of=/tmp/zero_file bs=1M; rm /tmp/zero_file; sync
+    ```
+* Then after shutting down the VM, run the following commands (clean and backup as needed):
+    ```bash
+    qemu-img convert -O qcow2 ubuntu24-aarch64-base.qcow2 compact.qcow2
+    mv compact.qcow2 ubuntu24-aarch64-base.qcow2
     ```
