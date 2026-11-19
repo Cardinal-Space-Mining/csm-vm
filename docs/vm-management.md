@@ -104,8 +104,9 @@ There are two ways to move a VM to a new release:
 ### Shrinking VM disk usage:
 * Inside the VM, run the following command:
     ```bash
-    dd if=/dev/zero of=/tmp/zero_file bs=1M; rm /tmp/zero_file; sync
+    sudo dd if=/dev/zero of=/var/tmp/zero_file bs=1M status=progress; sudo rm -f /var/tmp/zero_file; sync
     ```
+    This is expected to end with "No space left on device". Don't write the file to `/tmp`: on Ubuntu 26.04 it is a RAM-backed tmpfs, so the zeros never reach the disk (and `dd` fails with "Disk quota exceeded").
 * Then after shutting down the VM, run the following commands (clean and backup as needed):
     ```bash
     qemu-img convert -O qcow2 ubuntu-aarch64-base.qcow2 compact.qcow2
