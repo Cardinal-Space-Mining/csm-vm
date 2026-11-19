@@ -27,7 +27,7 @@ First, configure netplan:
       version: 2
       renderer: NetworkManager
       ethernets:
-        enp1s0:
+        enp0s1:
           optional: true
           dhcp4: true
         enx-usb-eth-lidar:
@@ -63,6 +63,7 @@ First, configure netplan:
                 password: "PASSWORD"
     ```
     * `SSID#` and `PASSWORD` should be filled with the target network SSIDs and passwords which should be connected to
+    * `enp0s1` is the bridged ethernet adapter created by `run-vm.sh`. Run `ip link show` to confirm the name on your VM; if it doesn't match, netplan will list the interface as "unmanaged" and none of its settings will apply
     * Check out the [networking debugging](#networking-debug) section below for tips on setting up networking interfaces
 
 3. If there are any other netplan configs present in the `/etc/netplan` directory, remove them now 
@@ -111,11 +112,11 @@ Finally, disable networkd and apply the netplan config:
     ```bash
     sudo systemctl disable systemd-networkd.service
     sudo systemctl disable systemd-networkd-wait-online.service
-    sudo systemctl disable systemd-resolved.service
     sudo systemctl stop --now systemd-networkd.service
     sudo systemctl stop --now systemd-networkd-wait-online.service
-    sudo systemctl stop --now systemd-resolved.service
     ```
+    > [!IMPORTANT]
+    > Leave `systemd-resolved` enabled. NetworkManager passes DNS servers to it, and `/etc/resolv.conf` is a symlink to its stub file, so disabling it breaks DNS. It does not cause boot delays: those come from the `*-wait-online` services.
 
 2. Run the following to apply the config:
     ```bash

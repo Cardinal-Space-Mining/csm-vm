@@ -64,15 +64,41 @@ The `CPUS`, `RAM`, `ETH_IFACE`, `MAC`, and `USB_WHITELIST` variables may be spec
     sudo ./autostart.sh --uninstall
     ```
 
+### Upgrading Ubuntu releases
+The disk files are named without a release number (`ubuntu-aarch64-base.qcow2`), since the release can change inside the VM. Disks from older versions of this script (`ubuntu24-aarch64-*.qcow2`) are renamed automatically the next time the script runs with the VM stopped. Pulling this repo doesn't change which Ubuntu release an existing VM runs.
+
+There are two ways to move a VM to a new release:
+
+**In-place upgrade (keeps the existing VM and its configuration)**
+1. Back up the base disk: `./run-vm.sh --stopd && ./run-vm.sh --backup`
+2. Disable autostart if installed, so a host reboot mid-upgrade doesn't discard the overlay: `sudo ./autostart.sh --uninstall`
+3. Start the VM attached to the terminal (the upgrade restarts SSH and networking): `./run-vm.sh --term`
+4. Inside the VM, fully update, then upgrade:
+    ```bash
+    sudo apt update && sudo apt full-upgrade
+    sudo reboot
+    sudo do-release-upgrade
+    ```
+    Keep your existing versions of config files when prompted, then re-enable any third-party apt sources the upgrade disabled.
+5. Shut down via the script so the overlay is committed, then re-enable autostart. If anything goes wrong, `./run-vm.sh --restore` restores the backup.
+
+**Fresh install (clean VM on the release in `ISO_URL`)**
+1. Shut the VM down with `./run-vm.sh --stopd` and disable autostart.
+2. Move the existing disk files and ISO out of the repo directory (keep them until the new VM works):
+    ```bash
+    mkdir -p ~/old-vm && mv ubuntu*-aarch64-*.qcow2 ubuntu-*.iso ~/old-vm/
+    ```
+3. Run `./run-vm.sh` to install, then follow [VM Bringup](vm-bringup.md) and re-enable autostart.
+
 ### Helpful QEMU commands if things are broken:
 * Check overlay integrity:
     ```bash
-    qemu-img check ubuntu24-aarch64-overlay.qcow2
+    qemu-img check ubuntu-aarch64-overlay.qcow2
     ```
 * Manually commit VM overlay:
     ```bash
-    qemu-img commit ubuntu24-aarch64-overlay.qcow2
-    rm -f ubuntu24-aarch64-overlay.qcow2
+    qemu-img commit ubuntu-aarch64-overlay.qcow2
+    rm -f ubuntu-aarch64-overlay.qcow2
     ```
 
 ### Shrinking VM disk usage:
@@ -82,6 +108,6 @@ The `CPUS`, `RAM`, `ETH_IFACE`, `MAC`, and `USB_WHITELIST` variables may be spec
     ```
 * Then after shutting down the VM, run the following commands (clean and backup as needed):
     ```bash
-    qemu-img convert -O qcow2 ubuntu24-aarch64-base.qcow2 compact.qcow2
-    mv compact.qcow2 ubuntu24-aarch64-base.qcow2
+    qemu-img convert -O qcow2 ubuntu-aarch64-base.qcow2 compact.qcow2
+    mv compact.qcow2 ubuntu-aarch64-base.qcow2
     ```

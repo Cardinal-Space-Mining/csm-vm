@@ -8,11 +8,14 @@ SCRIPTPATH=$(dirname "$SCRIPT")
 
 # --- Configuration ------------------------------------------------------------
 # The installer ISO
-ISO_URL="https://cdimage.ubuntu.com/ubuntu/releases/24.04/release/ubuntu-24.04.3-live-server-arm64.iso"
+ISO_URL="https://cdimage.ubuntu.com/ubuntu/releases/26.04/release/ubuntu-26.04.1-live-server-arm64.iso"
 ISO_NAME="$(basename "$ISO_URL")"
-# The VM storage disk (file)
-BASE_DISK_FILE="ubuntu24-aarch64-base.qcow2"
-OVERLAY_DISK_FILE="ubuntu24-aarch64-overlay.qcow2"
+# The VM storage disk (file). Names are release-agnostic since the guest can be
+# upgraded in place (do-release-upgrade) without the disk changing.
+BASE_DISK_FILE="ubuntu-aarch64-base.qcow2"
+OVERLAY_DISK_FILE="ubuntu-aarch64-overlay.qcow2"
+# Older versions of this script used release-specific names; these get migrated.
+LEGACY_DISK_PREFIXES=("ubuntu24-aarch64")
 BASE_DISK_PATH="$SCRIPTPATH/$BASE_DISK_FILE"
 OVERLAY_DISK_PATH="$SCRIPTPATH/$OVERLAY_DISK_FILE"
 BASE_DISK_BACKUP_PATH="$SCRIPTPATH/${BASE_DISK_FILE%.qcow2}.backup.qcow2"
@@ -76,6 +79,54 @@ QEMU_ARGS=(
 
 
 # --- Functionality ------------------------------------------------------------
+# Rename disks from older release-specific names (e.g. ubuntu24-aarch64-base.qcow2)
+# to the current names, repointing overlays at the renamed base. If a VM is running,
+# keep using the legacy paths for this invocation so stop/commit still work.
+migrate_legacy_disks() \
+{
+  [ -f "$BASE_DISK_PATH" ] && return 0
+
+  local prefix old_base old_overlay old_base_bak old_overlay_bak
+  for prefix in "${LEGACY_DISK_PREFIXES[@]}"; do
+    old_base="$SCRIPTPATH/${prefix}-base.qcow2"
+    [ -f "$old_base" ] || continue
+    old_overlay="$SCRIPTPATH/${prefix}-overlay.qcow2"
+    old_base_bak="$SCRIPTPATH/${prefix}-base.backup.qcow2"
+    old_overlay_bak="$SCRIPTPATH/${prefix}-overlay.backup.qcow2"
+
+    if pgrep -f "qemu-system-aarch64.*${old_overlay}" >/dev/null; then
+      echo "Note: VM is running on legacy disk names (${prefix}-*); they will be migrated on the next run after it stops."
+      BASE_DISK_PATH="$old_base"
+      OVERLAY_DISK_PATH="$old_overlay"
+      BASE_DISK_BACKUP_PATH="$old_base_bak"
+      OVERLAY_DISK_BACKUP_PATH="$old_overlay_bak"
+      return 0
+    fi
+
+    echo "Migrating legacy disk names ${prefix}-* -> ${BASE_DISK_FILE%-base.qcow2}-*..."
+    mv "$old_base" "$BASE_DISK_PATH"
+    if [ -f "$old_overlay" ]; then
+      mv "$old_overlay" "$OVERLAY_DISK_PATH"
+      # Unsafe rebase only rewrites the backing path; contents are unchanged
+      qemu-img rebase -u -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
+    fi
+    if [ -f "$old_base_bak" ]; then
+      mv "$old_base_bak" "$BASE_DISK_BACKUP_PATH" \
+        || echo "WARNING: Could not rename $old_base_bak"
+    fi
+    if [ -f "$old_overlay_bak" ]; then
+      if mv "$old_overlay_bak" "$OVERLAY_DISK_BACKUP_PATH"; then
+        qemu-img rebase -u -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_BACKUP_PATH" \
+          || echo "WARNING: Could not repoint $OVERLAY_DISK_BACKUP_PATH at the new base (try with sudo)."
+      else
+        echo "WARNING: Could not rename $old_overlay_bak"
+      fi
+    fi
+    echo "Migration complete."
+    return 0
+  done
+}
+
 create_and_use_disk_file() \
 {
   # Create base qcow2 image instead of raw to support read only base + overlay
@@ -140,14 +191,14 @@ create_or_reuse_overlay() \
 
 add_iso_file() \
 {
-  ISO_FILE="$(ls "$SCRIPTPATH"/ubuntu*.iso 2>/dev/null | head -n 1 || true)"
-  if [ -z "${ISO_FILE:-}" ]; then
+  # Only use the ISO matching ISO_URL so a leftover ISO from an older release isn't picked up
+  ISO_FILE="$SCRIPTPATH/$ISO_NAME"
+  if [ ! -f "$ISO_FILE" ]; then
     echo "No Ubuntu ISO found locally. Attempting to download..."
     echo "  $ISO_URL"
     # check if URL is reachable
     if curl -sfI "$ISO_URL" >/dev/null; then
-      curl -L -o "$ISO_NAME" "$ISO_URL"
-      ISO_FILE="$SCRIPTPATH/$ISO_NAME"
+      curl -L -o "$ISO_FILE" "$ISO_URL"
     else
       echo "ERROR: ISO not reachable at $ISO_URL" >&2
       exit 1
@@ -378,7 +429,26 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+migrate_legacy_disks
+
 if [ ! -f "$BASE_DISK_PATH" ]; then
+  # Never launch the interactive installer from launchd
+  if [ "$MODE" = "--launchd" ]; then
+    echo "ERROR: No base disk at $BASE_DISK_PATH. Run ./run-vm.sh manually to install the VM." >&2
+    exit 1
+  fi
+  # Refuse to start a fresh install if an unrecognized VM disk is present
+  shopt -s nullglob
+  OTHER_BASE_DISKS=( "$SCRIPTPATH"/*-base.qcow2 )
+  shopt -u nullglob
+  if [ ${#OTHER_BASE_DISKS[@]} -gt 0 ]; then
+    echo "ERROR: No base disk at $BASE_DISK_PATH, but found existing VM disk(s):" >&2
+    printf '  %s\n' "${OTHER_BASE_DISKS[@]}" >&2
+    echo "Refusing to start a fresh install. Either:" >&2
+    echo "  - keep using it: rename it to $BASE_DISK_FILE (commit any overlay first), or" >&2
+    echo "  - start fresh: move it out of this directory, then re-run." >&2
+    exit 1
+  fi
   # Create base disk file
   create_and_use_disk_file
   # Find or fetch Ubuntu Server ARM64 ISO and add to VM
