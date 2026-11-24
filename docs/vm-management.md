@@ -15,6 +15,8 @@ Script usage:
 * The `--wifi` flag configures the VM with internet access by sharing the Mac's wifi. This should only be used by macbook users as it is a bit flakey and requires port forwarding for ingoing network traffic.
 * The `--fkilld` flag kills any detected VM processes. Only use this in the case of serious issues.
 * The `--clean` flag cleans up any abandoned overlays by commiting them to the base storage.
+* The `--overlay commit|reuse|discard` option answers the "uncommitted overlay from a previous session" question in advance (with `--startd`, `--restartd` or `--term`). Without a terminal (ssh commands, csm-hub) the script stops with an error instead of asking, so pass it there.
+* In daemon and launchd mode the VM's serial console is a socket, `/tmp/qemu-serial.sock`. Connect with `sudo socat -,raw,echo=0 UNIX-CONNECT:/tmp/qemu-serial.sock` (exit with Ctrl-C) to log in and fix networking without SSH, like `--term` but while the VM keeps running in the background. csm-hub's VM panel has a button for it.
 * The `--backup` flag makes a copy of the current base disk file which can be restored later if necessary.
 * The `--restore` flag restores a backup disk file.
 

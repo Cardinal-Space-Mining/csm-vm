@@ -6,6 +6,10 @@ trap 'echo "Error: Script failed at line $LINENO."; exit 1;' ERR
 SCRIPT=$(readlink -f "$0")
 SCRIPTPATH=$(dirname "$SCRIPT")
 
+# Homebrew's tools (qemu, socat, pv) aren't on PATH in non-interactive shells
+# (ssh commands, launchd, the csm-hub agent).
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$PATH"
+
 # --- Configuration ------------------------------------------------------------
 # The installer ISO
 ISO_URL="https://cdimage.ubuntu.com/ubuntu/releases/26.04/release/ubuntu-26.04.1-live-server-arm64.iso"
@@ -32,6 +36,12 @@ MAC_HOST="52:54:00:12:34:57"    # the MAC address for the host-to-vm direct ifac
 MAC_WIFI="52:54:00:12:34:58"    # the MAC address for shared wifi internet access
 # Socket for calling shutdown
 MONITOR_SOCKET="/tmp/qemu-monitor.sock"
+# The VM's serial console in daemon/launchd mode (connect with
+# `sudo socat -,raw,echo=0 UNIX-CONNECT:/tmp/qemu-serial.sock`)
+SERIAL_SOCKET="/tmp/qemu-serial.sock"
+# What to do with an overlay left by a previous session, without asking:
+# commit | reuse | discard (set with --overlay; empty = ask)
+OVERLAY_CHOICE=""
 # USB Whitelist: Non-storage USB devices must be whitelisted here to be passed to QEMU.
 # Use `system_profiler SPUSBHostDataType` to list devices and find vendor/product id.
 # Format: "vendorid:productid"
@@ -148,17 +158,24 @@ create_or_reuse_overlay() \
     if qemu-img check "$OVERLAY_DISK_PATH" >/dev/null 2>&1; then
       echo "Overlay OK."
       if [ "$mode" = "interactive" ]; then
-        echo "An uncommitted overlay from a previous session was detected."
-        echo "  [c] Commit to base and start fresh"
-        echo "  [r] Reuse as-is (resume from previous state)"
-        echo "  [d] Discard and start fresh"
-        read -rp "Choice [c/r/d]: " OVERLAY_CHOICE
+        if [ -z "$OVERLAY_CHOICE" ] && [ ! -t 0 ]; then
+          echo "ERROR: An uncommitted overlay from a previous session was detected," >&2
+          echo "and there is no terminal to ask. Re-run with --overlay commit|reuse|discard." >&2
+          exit 1
+        fi
+        if [ -z "$OVERLAY_CHOICE" ]; then
+          echo "An uncommitted overlay from a previous session was detected."
+          echo "  [c] Commit to base and start fresh"
+          echo "  [r] Reuse as-is (resume from previous state)"
+          echo "  [d] Discard and start fresh"
+          read -rp "Choice [c/r/d]: " OVERLAY_CHOICE
+        fi
         case "$OVERLAY_CHOICE" in
-          c|C)
+          c|C|commit)
             commit_overlay
             qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
             ;;
-          d|D)
+          d|D|discard)
             echo "Discarding overlay..."
             rm -f "$OVERLAY_DISK_PATH"
             qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
@@ -347,20 +364,41 @@ run_terminal() \
   commit_overlay
 }
 
+# Without a terminal, sudo can't ask for a password: fail clearly instead of
+# leaving a background sudo waiting forever.
+check_sudo() \
+{
+  if [ -t 0 ]; then
+    sudo -v
+  elif ! sudo -n -l "$(command -v qemu-system-aarch64)" >/dev/null 2>&1; then
+    echo "ERROR: passwordless sudo for qemu-system-aarch64 is needed when there is no terminal." >&2
+    exit 1
+  fi
+}
+
 run_daemon() \
 {
-  QEMU_ARGS+=(-display none)
+  QEMU_ARGS+=(-display none -serial "unix:${SERIAL_SOCKET},server,nowait")
 
   echo "--- RUNNING QEMU (DAEMON) ---"
   echo "nohup qemu-system-aarch64 ${QEMU_ARGS[@]} >/dev/null 2>&1 &"
   echo "-----------------------------"
-  sudo -v
+  check_sudo
   nohup sudo qemu-system-aarch64 "${QEMU_ARGS[@]}" >/dev/null 2>&1 &
+
+  # QEMU fails fast on bad arguments or missing permissions: report it.
+  sleep 3
+  if pgrep -f "qemu-system-aarch64.*${OVERLAY_DISK_PATH}" >/dev/null; then
+    echo "VM started. Serial console: ${SERIAL_SOCKET}"
+  else
+    echo "ERROR: QEMU exited right away. Run with --term to see why." >&2
+    exit 1
+  fi
 }
 
 run_launchd() \
 {
-  QEMU_ARGS+=(-display none)
+  QEMU_ARGS+=(-display none -serial "unix:${SERIAL_SOCKET},server,nowait")
 
   echo "--- RUNNING QEMU (LAUNCHD) ---"
   echo "qemu-system-aarch64 ${QEMU_ARGS[@]}"
@@ -396,6 +434,8 @@ usage() \
     "\nOPTIONS:"\
     "\n --help | -h  : Print this help message and immediately exit."\
     "\n --wifi | -w  : Enable Wi-Fi sharing (vmnet-shared)."\
+    "\n --overlay X  : With --startd/--restartd/--term, what to do with an overlay left by"\
+    "\n                a previous session, without asking: commit, reuse or discard."\
     "\n --term       : Run the VM attached to the current terminal session."\
     "\n --startd     : Run the VM as a headless daemon."\
     "\n --stopd      : Attempt to shutdown a headless daemon VM."\
@@ -425,6 +465,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --term | --startd | --stopd | --restartd | --fkilld | --clean | --launchd | --backup | --restore | --status) MODE="$1"; shift ;;
     -w | --wifi) NET_MODE="wifi"; shift ;;
+    --overlay)
+      case "${2:-}" in
+        commit | reuse | discard) OVERLAY_CHOICE="$2"; shift 2 ;;
+        *) echo "ERROR: --overlay takes commit, reuse or discard" >&2; exit 1 ;;
+      esac
+      ;;
     -h | --help | *) MODE="help"; break ;;
   esac
 done
