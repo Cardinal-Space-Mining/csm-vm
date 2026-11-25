@@ -7,7 +7,7 @@ SCRIPT=$(readlink -f "$0")
 SCRIPTPATH=$(dirname "$SCRIPT")
 
 # Homebrew's tools (qemu, socat, pv) aren't on PATH in non-interactive shells
-# (ssh commands, launchd, the csm-hub agent).
+# (ssh commands, launchd, the orchestrator agent).
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$PATH"
 
 # --- Configuration ------------------------------------------------------------
