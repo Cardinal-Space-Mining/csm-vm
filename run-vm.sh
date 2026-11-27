@@ -43,6 +43,8 @@ SERIAL_SOCKET="/tmp/qemu-serial.sock"
 # its power button (override with --timeout SECONDS). A hung guest otherwise
 # keeps them waiting forever.
 STOP_TIMEOUT_S=120
+# Pressed again this often while waiting: a press during boot is lost
+POWER_PRESS_PERIOD_S=10
 # QEMU's own output in daemon mode (errors when it fails to start)
 QEMU_LOG="$SCRIPTPATH/qemu.log"
 # How long to wait at boot for the bridged interface to appear
@@ -194,6 +196,10 @@ create_and_use_disk_file() \
 create_or_reuse_overlay() \
 {
   local mode="${1:-interactive}"
+
+  # The overlay may be being committed (the VM just powered itself off)
+  lock_commit
+  unlock_commit
 
   if [ -f "$OVERLAY_DISK_PATH" ]; then
     echo "Found existing overlay: $OVERLAY_DISK_PATH. Checking integrity..."
@@ -377,10 +383,45 @@ restore_base() \
   echo "Restore complete. Previous overlay discarded."
 }
 
+# One commit at a time: when the VM exits, both the watcher (run_daemon) and
+# --stopd commit, and a start must not open an overlay being committed. The
+# lock is a directory (mkdir is atomic) holding its owner's PID; one left by a
+# commit that was killed is taken over.
+lock_commit() \
+{
+  local me holder waited=0
+  me=$(sh -c 'echo $PPID')  # this (sub)shell's PID: bash 3.2 has no BASHPID
+  until mkdir "$COMMIT_LOCK" 2>/dev/null; do
+    holder=$(cat "$COMMIT_LOCK/pid" 2>/dev/null || true)
+    if [ -n "$holder" ] && ! ps -p "$holder" >/dev/null 2>&1; then
+      rm -rf "$COMMIT_LOCK"
+      continue
+    fi
+    if [ "$waited" -eq 0 ]; then
+      echo "Waiting for a commit of the overlay to finish..."
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "$me" > "$COMMIT_LOCK/pid"
+  give_to_owner "$COMMIT_LOCK" "$COMMIT_LOCK/pid"
+}
+
+unlock_commit() \
+{
+  rm -rf "$COMMIT_LOCK"
+}
+
 # Returns 1 if the commit fails (the overlay is kept for manual recovery).
 commit_overlay() \
 {
   [ -f "$OVERLAY_DISK_PATH" ] || return 0
+  lock_commit
+  if [ ! -f "$OVERLAY_DISK_PATH" ]; then
+    unlock_commit
+    echo "The overlay was already committed."
+    return 0
+  fi
   if [ -f "$UNCLEAN_MARKER" ]; then
     echo "WARNING: this overlay is from a VM that was force-stopped: the guest"
     echo "didn't shut down, so files written just before may be incomplete."
@@ -397,7 +438,9 @@ commit_overlay() \
   if [ "$status" -eq 0 ]; then
     echo "Overlay committed successfully."
     rm -f "$OVERLAY_DISK_PATH" "$UNCLEAN_MARKER"
+    unlock_commit
   else
+    unlock_commit
     echo "ERROR: commit failed; the overlay is kept for manual recovery." >&2
     return 1
   fi
@@ -469,8 +512,18 @@ run_daemon() \
   echo "nohup qemu-system-aarch64 ${QEMU_ARGS[@]} >$QEMU_LOG 2>&1 &"
   echo "-----------------------------"
   check_sudo
-  nohup sudo qemu-system-aarch64 "${QEMU_ARGS[@]}" >"$QEMU_LOG" 2>&1 &
+  : >"$QEMU_LOG"
   give_to_owner "$QEMU_LOG"
+  # A watcher runs QEMU and handles its exit (qemu_exited). Like nohup it
+  # ignores only SIGHUP: QEMU inherits ignored signals, and must still stop
+  # on SIGTERM when macOS shuts down.
+  (
+    trap '' HUP
+    status=0
+    sudo qemu-system-aarch64 "${QEMU_ARGS[@]}" || status=$?
+    qemu_exited "$status"
+  ) </dev/null >>"$QEMU_LOG" 2>&1 &
+  local watcher=$!
 
   # QEMU fails fast on bad arguments or missing permissions: report it.
   sleep 3
@@ -480,12 +533,34 @@ run_daemon() \
     echo "ERROR: QEMU exited right away. Its output ($QEMU_LOG):" >&2
     # (without the libusb warnings QEMU prints for every passed-through device)
     grep -v "libusb_kernel_driver_active" "$QEMU_LOG" | tail -n 20 >&2 || true
+    # The guest never ran: the watcher's "unclean" mark doesn't apply
+    wait "$watcher" || true
+    rm -f "$UNCLEAN_MARKER"
     # An overlay made by this start holds nothing yet: don't leave it behind
     if [ "$CREATED_OVERLAY" -eq 1 ]; then
       rm -f "$OVERLAY_DISK_PATH"
       echo "Removed the empty overlay this start created." >&2
     fi
     exit 1
+  fi
+}
+
+# QEMU (daemon mode) exited. A guest that powered itself off (sudo poweroff)
+# leaves QEMU's exit code 0: commit its overlay, as --stopd would. QEMU
+# killed or crashed: mark the overlay unclean. (A SIGTERM, e.g. macOS shutting
+# down, also exits 0, but QEMU logs "terminating on signal".)
+qemu_exited() \
+{
+  local status=$1
+  echo "--- QEMU exited with status $status at $(date '+%Y-%m-%d %H:%M:%S') ---"
+  [ -f "$OVERLAY_DISK_PATH" ] || return 0
+  if [ "$status" -eq 0 ] && ! grep -q "terminating on signal" "$QEMU_LOG"; then
+    echo "The guest powered off."
+    commit_overlay || true
+  else
+    touch "$UNCLEAN_MARKER"
+    give_to_owner "$UNCLEAN_MARKER"
+    echo "The guest didn't shut down: its overlay is marked unclean."
   fi
 }
 
@@ -502,6 +577,11 @@ run_launchd() \
   commit_overlay || exit 1
 }
 
+press_power_button() \
+{
+  echo "system_powerdown" | as_root socat - UNIX-CONNECT:"$MONITOR_SOCKET" >/dev/null
+}
+
 # Press the guest's power button, wait (at most STOP_TIMEOUT_S) for it to power
 # off, then commit its overlay. Exits 2 on a timeout: the VM is still running.
 run_shutdown() \
@@ -516,7 +596,7 @@ run_shutdown() \
     exit 1
   fi
   echo "Pressing the VM's power button..."
-  if ! echo "system_powerdown" | as_root socat - UNIX-CONNECT:"$MONITOR_SOCKET" >/dev/null; then
+  if ! press_power_button; then
     echo "ERROR: could not reach the VM's monitor (as root: passwordless sudo is" >&2
     echo "needed without a terminal)." >&2
     exit 1
@@ -533,8 +613,11 @@ run_shutdown() \
     fi
     sleep 1
     waited=$((waited + 1))
-    if [ $((waited % 15)) -eq 0 ]; then
-      echo "  still running after ${waited}s..."
+    # A press while the guest boots is lost (nothing listens for the button
+    # before systemd-logind starts), so keep pressing.
+    if [ $((waited % POWER_PRESS_PERIOD_S)) -eq 0 ]; then
+      echo "  still running after ${waited}s: pressing the power button again"
+      press_power_button || true
     fi
   done
   echo "VM powered off after ${waited}s."
@@ -602,6 +685,7 @@ done
 migrate_legacy_disks
 # Marks an overlay a force stop left behind (after migration fixes the paths)
 UNCLEAN_MARKER="${OVERLAY_DISK_PATH}.unclean"
+COMMIT_LOCK="${OVERLAY_DISK_PATH}.lock"
 
 if [ ! -f "$BASE_DISK_PATH" ]; then
   # Never launch the interactive installer from launchd
