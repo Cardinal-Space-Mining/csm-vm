@@ -45,6 +45,13 @@ SERIAL_SOCKET="/tmp/qemu-serial.sock"
 STOP_TIMEOUT_S=120
 # Pressed again this often while waiting: a press during boot is lost
 POWER_PRESS_PERIOD_S=10
+# An overlay left by a session that didn't shut down (a power cut, an e-stop)
+# is kept as ubuntu-aarch64-overlay.saved-<when it was last written>.qcow2;
+# this many of the newest are kept (each can be gigabytes).
+SAVED_OVERLAYS_KEPT=5
+# What --launchd (autostart at boot) does with such an overlay: "save" it and
+# boot the base disk, or "reuse" it (boot straight back into that session).
+LAUNCHD_OVERLAY="save"
 # QEMU's own output in daemon mode (errors when it fails to start)
 QEMU_LOG="$SCRIPTPATH/qemu.log"
 # How long to wait at boot for the bridged interface to appear
@@ -122,12 +129,132 @@ give_to_owner() \
   fi
 }
 
+# --- Saved overlays (sessions that didn't shut down) ---
+# The legacy single "backup" slot counts as one too.
+saved_overlays() \
+{
+  local prefix="${OVERLAY_DISK_PATH%.qcow2}"
+  ls -1tr "$prefix".saved-*.qcow2 "${prefix}.backup.qcow2" 2>/dev/null || true
+}
+
+# Move the current overlay aside as a saved session (newest SAVED_OVERLAYS_KEPT
+# are kept). Its name says when it was last written: when that session ended.
+save_overlay() \
+{
+  local stamp target n=1
+  stamp=$(stat -f %Sm -t %Y%m%d-%H%M%S "$OVERLAY_DISK_PATH")
+  target="${OVERLAY_DISK_PATH%.qcow2}.saved-${stamp}.qcow2"
+  while [ -e "$target" ]; do
+    target="${OVERLAY_DISK_PATH%.qcow2}.saved-${stamp}-${n}.qcow2"
+    n=$((n + 1))
+  done
+  mv "$OVERLAY_DISK_PATH" "$target"
+  rm -f "$UNCLEAN_MARKER" "$RECOVERED_MARKER"
+  give_to_owner "$target"
+  echo "Saved the previous session's overlay as $(basename "$target")" \
+    "($(du -h "$target" | cut -f1)): recover it with --recover $(basename "$target")."
+}
+
+prune_saved_overlays() \
+{
+  local all count
+  all=$(saved_overlays)
+  count=$(printf '%s\n' "$all" | grep -c . || true)
+  while [ "$count" -gt "$SAVED_OVERLAYS_KEPT" ]; do
+    local oldest
+    oldest=$(printf '%s\n' "$all" | head -1)
+    rm -f "$oldest"
+    echo "Deleted the oldest saved overlay, $(basename "$oldest") (keeping $SAVED_OVERLAYS_KEPT)."
+    all=$(printf '%s\n' "$all" | tail -n +2)
+    count=$((count - 1))
+  done
+}
+
+# Run qemu-img on files we may not own (made by a root-run start) as root.
+qemu_img_on() \
+{
+  local file="$1"
+  shift
+  if [ -w "$file" ]; then
+    qemu-img "$@"
+  else
+    as_root qemu-img "$@"
+  fi
+}
+
+# A saved overlay only holds what its session changed; the rest it reads from
+# the base disk. Committing another overlay changes the base under it, so
+# first copy into each saved overlay the old base data that the commit will
+# replace (a "safe" rebase onto the overlay being committed), and point it
+# back at the base after.
+protect_saved_overlays() \
+{
+  local saved
+  for saved in $(saved_overlays); do
+    echo "Keeping saved overlay $(basename "$saved") intact..."
+    if ! qemu_img_on "$saved" rebase -f qcow2 -F qcow2 -b "$OVERLAY_DISK_PATH" "$saved"; then
+      echo "ERROR: could not protect $(basename "$saved"); not committing." >&2
+      repoint_saved_overlays safe
+      return 1
+    fi
+  done
+}
+
+# After the commit (or, with "safe", to undo protect_saved_overlays).
+repoint_saved_overlays() \
+{
+  local saved unsafe="-u"
+  [ "${1:-}" = safe ] && unsafe=""
+  for saved in $(saved_overlays); do
+    qemu_img_on "$saved" rebase $unsafe -f qcow2 -F qcow2 -b "$BASE_DISK_PATH" "$saved" \
+      || echo "WARNING: could not point $(basename "$saved") back at the base disk." >&2
+  done
+}
+
+# Make a saved overlay the VM's overlay again (the current one, if any, is saved
+# first), so the next start with --overlay reuse boots that session.
+recover_saved() \
+{
+  local name="$1" path
+  path="$SCRIPTPATH/$(basename "$name")"
+  if ! saved_overlays | grep -qxF "$path"; then
+    echo "ERROR: no saved overlay $name. Saved: $(saved_overlays | xargs -n1 basename 2>/dev/null | tr '\n' ' ')" >&2
+    exit 1
+  fi
+  verify_not_running
+  lock_commit
+  if [ -f "$OVERLAY_DISK_PATH" ]; then
+    save_overlay
+  fi
+  mv "$path" "$OVERLAY_DISK_PATH"
+  # A session that didn't shut down, recovered (for its logs, say): stopping it
+  # won't commit it (auto_commit); --clean does
+  touch "$UNCLEAN_MARKER" "$RECOVERED_MARKER"
+  give_to_owner "$UNCLEAN_MARKER" "$RECOVERED_MARKER"
+  unlock_commit
+  prune_saved_overlays
+  echo "Recovered $(basename "$path"): start the VM with --overlay reuse to boot that session."
+  echo "Stopping it won't commit it: commit it with --clean if you want it, or discard it."
+}
+
+forget_saved() \
+{
+  local name="$1" path
+  path="$SCRIPTPATH/$(basename "$name")"
+  if ! saved_overlays | grep -qxF "$path"; then
+    echo "ERROR: no saved overlay $name." >&2
+    exit 1
+  fi
+  rm -f "$path"
+  echo "Deleted $(basename "$path")."
+}
+
 # A fresh, empty overlay on the base disk. CREATED_OVERLAY tells run_daemon it
 # may remove it again if QEMU fails to start (it holds nothing yet).
 CREATED_OVERLAY=0
 new_overlay() \
 {
-  rm -f "$UNCLEAN_MARKER"
+  rm -f "$UNCLEAN_MARKER" "$RECOVERED_MARKER"
   qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
   give_to_owner "$OVERLAY_DISK_PATH"
   CREATED_OVERLAY=1
@@ -225,24 +352,26 @@ create_or_reuse_overlay() \
             ;;
           d|D|discard)
             echo "Discarding overlay..."
-            rm -f "$OVERLAY_DISK_PATH"
+            rm -f "$OVERLAY_DISK_PATH" "$RECOVERED_MARKER"
             new_overlay
             ;;
           *)
             echo "Reusing existing overlay."
             ;;
         esac
+      elif [ "$LAUNCHD_OVERLAY" = reuse ]; then
+        echo "Reusing the previous session's overlay (LAUNCHD_OVERLAY=reuse)."
       else
-        # Non-interactive (launchd): save one rolling backup, then start fresh
-        echo "WARNING: Uncommitted overlay detected from a previous session. Saving backup and discarding."
-        mv -f "$OVERLAY_DISK_PATH" "$OVERLAY_DISK_BACKUP_PATH" 2>/dev/null \
-          || { echo "WARNING: Could not save backup; discarding overlay."; rm -f "$OVERLAY_DISK_PATH"; }
+        # Non-interactive (launchd): keep the session, boot the base disk
+        echo "An overlay from a previous session is here (it didn't shut down)."
+        save_overlay
+        prune_saved_overlays
         new_overlay
       fi
     else
-      echo "Overlay corrupted. Saving backup and creating new overlay."
-      mv -f "$OVERLAY_DISK_PATH" "$OVERLAY_DISK_BACKUP_PATH" 2>/dev/null \
-        || { echo "WARNING: Could not save backup; discarding overlay."; rm -f "$OVERLAY_DISK_PATH"; }
+      echo "Overlay corrupted (qemu-img check failed): saving it anyway, creating a new one."
+      save_overlay
+      prune_saved_overlays
       new_overlay
     fi
   else
@@ -373,13 +502,19 @@ backup_base() \
 restore_base() \
 {
   verify_not_running
+  if [ -n "$(saved_overlays)" ]; then
+    echo "ERROR: saved overlays depend on the current base disk and would be unreadable" >&2
+    echo "after a restore. Recover what you need from them, then delete them (--forget):" >&2
+    saved_overlays | xargs -n1 basename >&2
+    exit 1
+  fi
   if [ ! -f "$BASE_DISK_BACKUP_PATH" ]; then
     echo "ERROR: No backup found at $BASE_DISK_BACKUP_PATH" >&2
     exit 1
   fi
   echo "Restoring base disk from backup..."
   copy_with_progress "$BASE_DISK_BACKUP_PATH" "$BASE_DISK_PATH"
-  rm -f "$OVERLAY_DISK_PATH" "$UNCLEAN_MARKER"
+  rm -f "$OVERLAY_DISK_PATH" "$UNCLEAN_MARKER" "$RECOVERED_MARKER"
   echo "Restore complete. Previous overlay discarded."
 }
 
@@ -412,6 +547,18 @@ unlock_commit() \
   rm -rf "$COMMIT_LOCK"
 }
 
+# The commit after a clean shutdown, except for a recovered session (it's
+# committed only on request, with --clean).
+auto_commit() \
+{
+  if [ -f "$RECOVERED_MARKER" ]; then
+    echo "Not committing: this overlay is a recovered session. Commit it with --clean,"
+    echo "or discard it when you start the VM next."
+    return 0
+  fi
+  commit_overlay
+}
+
 # Returns 1 if the commit fails (the overlay is kept for manual recovery).
 commit_overlay() \
 {
@@ -426,6 +573,10 @@ commit_overlay() \
     echo "WARNING: this overlay is from a VM that was force-stopped: the guest"
     echo "didn't shut down, so files written just before may be incomplete."
   fi
+  if ! protect_saved_overlays; then
+    unlock_commit
+    return 1
+  fi
   echo "Committing overlay to base..."
   local status=0
   # Files made by an older root-run start aren't writable by us: commit as root
@@ -437,9 +588,11 @@ commit_overlay() \
   fi
   if [ "$status" -eq 0 ]; then
     echo "Overlay committed successfully."
-    rm -f "$OVERLAY_DISK_PATH" "$UNCLEAN_MARKER"
+    repoint_saved_overlays
+    rm -f "$OVERLAY_DISK_PATH" "$UNCLEAN_MARKER" "$RECOVERED_MARKER"
     unlock_commit
   else
+    repoint_saved_overlays safe
     unlock_commit
     echo "ERROR: commit failed; the overlay is kept for manual recovery." >&2
     return 1
@@ -487,9 +640,12 @@ run_terminal() \
   echo "qemu-system-aarch64 ${QEMU_ARGS[@]}"
   echo "--------------------"
   
-  sudo qemu-system-aarch64 "${QEMU_ARGS[@]}"
+  : >"$QEMU_LOG"
+  local status=0
+  sudo qemu-system-aarch64 "${QEMU_ARGS[@]}" || status=$?
+  echo "--- QEMU exited with status $status at $(date '+%Y-%m-%d %H:%M:%S') ---" >>"$QEMU_LOG"
 
-  commit_overlay || exit 1
+  auto_commit || exit 1
 }
 
 # Without a terminal, sudo can't ask for a password: fail clearly instead of
@@ -556,7 +712,7 @@ qemu_exited() \
   [ -f "$OVERLAY_DISK_PATH" ] || return 0
   if [ "$status" -eq 0 ] && ! grep -q "terminating on signal" "$QEMU_LOG"; then
     echo "The guest powered off."
-    commit_overlay || true
+    auto_commit || true
   else
     touch "$UNCLEAN_MARKER"
     give_to_owner "$UNCLEAN_MARKER"
@@ -564,18 +720,23 @@ qemu_exited() \
   fi
 }
 
-# An overlay left by a VM stopped with a signal (the mac shut down with the VM
-# running) is unclean too: the guest didn't shut down. QEMU logs "terminating
-# on signal", but the watcher may not have lived to mark the overlay.
-note_signalled_vm() \
+# An overlay whose VM didn't shut down is unclean even if nothing marked it:
+# a power cut or e-stop (QEMU's exit was never recorded in its log), or the mac
+# shutting down with the VM running (QEMU logs "terminating on signal", and the
+# watcher died with it).
+note_unclean_leftover() \
 {
-  if [ -f "$OVERLAY_DISK_PATH" ] && [ ! -f "$UNCLEAN_MARKER" ] \
-      && ! pgrep -f "qemu-system-aarch64.*${OVERLAY_DISK_PATH}" >/dev/null \
-      && grep -q "terminating on signal" "$QEMU_LOG" 2>/dev/null; then
+  [ -f "$OVERLAY_DISK_PATH" ] && [ ! -f "$UNCLEAN_MARKER" ] && [ -f "$QEMU_LOG" ] \
+    || return 0
+  if pgrep -f "qemu-system-aarch64.*${OVERLAY_DISK_PATH}" >/dev/null; then
+    return 0
+  fi
+  if grep -q "terminating on signal" "$QEMU_LOG" \
+      || ! grep -q "^--- QEMU exited" "$QEMU_LOG"; then
     touch "$UNCLEAN_MARKER"
     give_to_owner "$UNCLEAN_MARKER"
-    echo "Note: the VM was stopped by a signal (the mac shut down with it running?):"
-    echo "its overlay is marked unclean."
+    echo "Note: the VM didn't shut down last time (power cut, e-stop, the mac shutting"
+    echo "down with it running, or a kill): its overlay is marked unclean."
   fi
 }
 
@@ -584,12 +745,16 @@ run_launchd() \
   QEMU_ARGS+=(-display none -serial "unix:${SERIAL_SOCKET},server,nowait")
 
   echo "--- RUNNING QEMU (LAUNCHD) ---"
-  echo "qemu-system-aarch64 ${QEMU_ARGS[@]}"
+  echo "qemu-system-aarch64 ${QEMU_ARGS[@]} >>$QEMU_LOG 2>&1"
   echo "------------------------------"
 
-  qemu-system-aarch64 "${QEMU_ARGS[@]}"
-
-  commit_overlay || exit 1
+  : >"$QEMU_LOG"
+  give_to_owner "$QEMU_LOG"
+  local status=0
+  qemu-system-aarch64 "${QEMU_ARGS[@]}" >>"$QEMU_LOG" 2>&1 || status=$?
+  # Commits only if the guest powered off (as in daemon mode)
+  qemu_exited "$status" >>"$QEMU_LOG" 2>&1
+  tail -n 4 "$QEMU_LOG"
 }
 
 press_power_button() \
@@ -637,7 +802,7 @@ run_shutdown() \
   done
   echo "VM powered off after ${waited}s."
 
-  commit_overlay || exit 1
+  auto_commit || exit 1
 }
 
 
@@ -662,9 +827,24 @@ usage() \
     "\n --backup     : Copy the base disk to a single backup file (VM must be stopped)."\
     "\n --restore    : Restore the base disk from the backup file (VM must be stopped)."\
     "\n --status     : Report whether the VM is currently running."\
+    "\n --list-saved : List saved overlays (sessions that didn't shut down)."\
+    "\n --recover F  : Make saved overlay F the VM's overlay (the current one is saved"\
+    "\n                first); start with --overlay reuse to boot that session."\
+    "\n --forget F   : Delete saved overlay F."\
     "\nIf no install is detected, a terminal session will be spawned"\
     "\nto setup the VM regardless of the provided flags."
   exit 0
+}
+
+# Never two VMs at once (autostart and a start from Orca right after boot).
+refuse_if_running() \
+{
+  local pids
+  pids=$(qemu_pids)
+  if [ -n "$pids" ]; then
+    echo "ERROR: a VM is already running (PID $(echo $pids)): stop it first." >&2
+    exit 1
+  fi
 }
 
 verify_not_running() \
@@ -679,7 +859,10 @@ verify_not_running() \
 MODE="default"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --term | --startd | --stopd | --restartd | --fkilld | --clean | --launchd | --backup | --restore | --status) MODE="$1"; shift ;;
+    --term | --startd | --stopd | --restartd | --fkilld | --clean | --launchd | --backup | --restore | --status | --list-saved) MODE="$1"; shift ;;
+    --recover | --forget)
+      if [ -z "${2:-}" ]; then echo "ERROR: $1 takes a saved overlay's file name" >&2; exit 1; fi
+      MODE="$1"; SAVED_NAME="$2"; shift 2 ;;
     -w | --wifi) NET_MODE="wifi"; shift ;;
     --timeout)
       case "${2:-}" in
@@ -701,7 +884,8 @@ migrate_legacy_disks
 # Marks an overlay a force stop left behind (after migration fixes the paths)
 UNCLEAN_MARKER="${OVERLAY_DISK_PATH}.unclean"
 COMMIT_LOCK="${OVERLAY_DISK_PATH}.lock"
-note_signalled_vm
+RECOVERED_MARKER="${OVERLAY_DISK_PATH}.recovered"
+note_unclean_leftover
 
 if [ ! -f "$BASE_DISK_PATH" ]; then
   # Never launch the interactive installer from launchd
@@ -734,6 +918,7 @@ else
   case "$MODE" in
     --startd)
       # Start daemon
+      refuse_if_running
       add_networking
       add_usb_devices
       create_or_reuse_overlay interactive
@@ -746,6 +931,7 @@ else
     --restartd)
       # Call shutdown then start daemon (run_shutdown exits if it times out)
       run_shutdown
+      refuse_if_running
       add_networking
       add_usb_devices
       create_or_reuse_overlay interactive
@@ -753,12 +939,14 @@ else
       ;;
     --term)
       # Run terminal session
+      refuse_if_running
       add_networking
       add_usb_devices
       create_or_reuse_overlay interactive
       run_terminal
       ;;
     --launchd)
+      refuse_if_running
       add_networking
       add_usb_devices
       create_or_reuse_overlay non-interactive
@@ -780,6 +968,18 @@ else
       ;;
     --restore)
       restore_base
+      ;;
+    --list-saved)
+      for saved in $(saved_overlays); do
+        echo "$(basename "$saved")  $(du -h "$saved" | cut -f1)"
+      done
+      ;;
+    --recover)
+      recover_saved "$SAVED_NAME"
+      ;;
+    --forget)
+      verify_not_running
+      forget_saved "$SAVED_NAME"
       ;;
     --status)
       PIDS=$(ps aux | grep '[q]emu-system-aarch64' | awk '{print $2}' || true)

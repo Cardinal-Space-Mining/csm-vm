@@ -7,3 +7,4 @@ machine.conf
 qemu.log
 *.unclean
 *.lock
+*.recovered
