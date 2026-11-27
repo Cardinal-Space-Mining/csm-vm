@@ -478,7 +478,8 @@ run_daemon() \
     echo "VM started. Serial console: ${SERIAL_SOCKET}"
   else
     echo "ERROR: QEMU exited right away. Its output ($QEMU_LOG):" >&2
-    tail -n 20 "$QEMU_LOG" >&2 || true
+    # (without the libusb warnings QEMU prints for every passed-through device)
+    grep -v "libusb_kernel_driver_active" "$QEMU_LOG" | tail -n 20 >&2 || true
     # An overlay made by this start holds nothing yet: don't leave it behind
     if [ "$CREATED_OVERLAY" -eq 1 ]; then
       rm -f "$OVERLAY_DISK_PATH"
