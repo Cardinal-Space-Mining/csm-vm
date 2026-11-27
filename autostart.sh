@@ -69,6 +69,9 @@ install_daemon() \
 </plist>
 EOF
 
+  # Readable whatever the umask (Orca reads it to know the VM autostarts)
+  sudo chown root:wheel "$LAUNCHD_PLIST"
+  sudo chmod 644 "$LAUNCHD_PLIST"
   sudo launchctl bootstrap system "$LAUNCHD_PLIST"
   echo "LaunchDaemon installed and started."
   echo "Logs: $LOG_FILE"
