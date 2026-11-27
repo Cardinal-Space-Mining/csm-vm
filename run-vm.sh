@@ -170,45 +170,79 @@ prune_saved_overlays() \
   done
 }
 
-# Run qemu-img on files we may not own (made by a root-run start) as root.
-qemu_img_on() \
+# Ranges an image holds itself, not its backing file ("start length" in bytes,
+# one per line): what its session wrote, and what it zeroed (TRIM) as well.
+own_ranges() \
 {
-  local file="$1"
-  shift
-  if [ -w "$file" ]; then
-    qemu-img "$@"
-  else
-    as_root qemu-img "$@"
-  fi
+  qemu-img map -f qcow2 --output=json "$1" \
+    | sed -n 's/.*"start": *\([0-9]*\), *"length": *\([0-9]*\), *"depth": *0,.*/\1 \2/p'
+}
+
+# Ranges of $1 ("start length" lines) not covered by those of $2.
+subtract_ranges() \
+{
+  # (FILENAME, not NR == FNR: the cuts file may be empty)
+  awk 'BEGIN { n = 0 }
+       FILENAME == ARGV[1] { cut_start[n] = $1; cut_end[n] = $1 + $2; n++; next }
+       { start = $1; end = $1 + $2
+         for (i = 0; i < n && start < end; i++) {
+           if (cut_end[i] <= start || cut_start[i] >= end) continue
+           if (cut_start[i] > start) print start, cut_start[i] - start
+           start = cut_end[i]
+         }
+         if (start < end) print start, end - start }' "$2" "$1"
 }
 
 # A saved overlay only holds what its session changed; the rest it reads from
 # the base disk. Committing another overlay changes the base under it, so
-# first copy into each saved overlay the old base data that the commit will
-# replace (a "safe" rebase onto the overlay being committed), and point it
-# back at the base after.
+# first copy into each saved overlay the base data the commit will replace
+# (where the saved overlay doesn't hold its own). Costs about what the commit
+# itself does. A failure halfway is harmless: what was copied is what the
+# saved overlay read from the base anyway.
 protect_saved_overlays() \
 {
-  local saved
+  local saved work changed
+  [ -n "$(saved_overlays)" ] || return 0
+  work=$(mktemp -d)
+  own_ranges "$OVERLAY_DISK_PATH" >"$work/changed"
   for saved in $(saved_overlays); do
     echo "Keeping saved overlay $(basename "$saved") intact..."
-    if ! qemu_img_on "$saved" rebase -f qcow2 -F qcow2 -b "$OVERLAY_DISK_PATH" "$saved"; then
+    own_ranges "$saved" >"$work/saved"
+    subtract_ranges "$work/changed" "$work/saved" >"$work/copy"
+    if ! copy_base_ranges "$saved" "$work/copy" "$work/chunk"; then
       echo "ERROR: could not protect $(basename "$saved"); not committing." >&2
-      repoint_saved_overlays safe
+      rm -rf "$work"
       return 1
     fi
   done
+  rm -rf "$work"
 }
 
-# After the commit (or, with "safe", to undo protect_saved_overlays).
-repoint_saved_overlays() \
+# Copy the base disk's data for the ranges in file $2 into image $1, in chunks
+# of at most 256 MiB (via the temporary file $3). A range of the base is read
+# through the raw driver's offset/size window (qemu-img dd can't seek: it
+# refuses a skip past count * bs).
+copy_base_ranges() \
 {
-  local saved unsafe="-u"
-  [ "${1:-}" = safe ] && unsafe=""
-  for saved in $(saved_overlays); do
-    qemu_img_on "$saved" rebase $unsafe -f qcow2 -F qcow2 -b "$BASE_DISK_PATH" "$saved" \
-      || echo "WARNING: could not point $(basename "$saved") back at the base disk." >&2
-  done
+  local saved="$1" ranges="$2" chunk="$3" start length size
+  local max=$((256 * 1024 * 1024))
+  while read -r start length; do
+    while [ "$length" -gt 0 ]; do
+      size=$length
+      [ "$size" -gt "$max" ] && size=$max
+      rm -f "$chunk"
+      qemu-img convert -O raw --image-opts \
+        "driver=raw,offset=$start,size=$size,file.driver=qcow2,file.file.filename=$BASE_DISK_PATH" \
+        "$chunk" || return 1
+      if [ -w "$saved" ]; then
+        qemu-io -f qcow2 -c "write -q -s $chunk $start $size" "$saved" || return 1
+      else
+        as_root qemu-io -f qcow2 -c "write -q -s $chunk $start $size" "$saved" || return 1
+      fi
+      start=$((start + size))
+      length=$((length - size))
+    done
+  done <"$ranges"
 }
 
 # Make a saved overlay the VM's overlay again (the current one, if any, is saved
@@ -588,11 +622,9 @@ commit_overlay() \
   fi
   if [ "$status" -eq 0 ]; then
     echo "Overlay committed successfully."
-    repoint_saved_overlays
     rm -f "$OVERLAY_DISK_PATH" "$UNCLEAN_MARKER" "$RECOVERED_MARKER"
     unlock_commit
   else
-    repoint_saved_overlays safe
     unlock_commit
     echo "ERROR: commit failed; the overlay is kept for manual recovery." >&2
     return 1
