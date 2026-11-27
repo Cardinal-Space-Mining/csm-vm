@@ -564,6 +564,21 @@ qemu_exited() \
   fi
 }
 
+# An overlay left by a VM stopped with a signal (the mac shut down with the VM
+# running) is unclean too: the guest didn't shut down. QEMU logs "terminating
+# on signal", but the watcher may not have lived to mark the overlay.
+note_signalled_vm() \
+{
+  if [ -f "$OVERLAY_DISK_PATH" ] && [ ! -f "$UNCLEAN_MARKER" ] \
+      && ! pgrep -f "qemu-system-aarch64.*${OVERLAY_DISK_PATH}" >/dev/null \
+      && grep -q "terminating on signal" "$QEMU_LOG" 2>/dev/null; then
+    touch "$UNCLEAN_MARKER"
+    give_to_owner "$UNCLEAN_MARKER"
+    echo "Note: the VM was stopped by a signal (the mac shut down with it running?):"
+    echo "its overlay is marked unclean."
+  fi
+}
+
 run_launchd() \
 {
   QEMU_ARGS+=(-display none -serial "unix:${SERIAL_SOCKET},server,nowait")
@@ -686,6 +701,7 @@ migrate_legacy_disks
 # Marks an overlay a force stop left behind (after migration fixes the paths)
 UNCLEAN_MARKER="${OVERLAY_DISK_PATH}.unclean"
 COMMIT_LOCK="${OVERLAY_DISK_PATH}.lock"
+note_signalled_vm
 
 if [ ! -f "$BASE_DISK_PATH" ]; then
   # Never launch the interactive installer from launchd
