@@ -39,6 +39,14 @@ MONITOR_SOCKET="/tmp/qemu-monitor.sock"
 # The VM's serial console in daemon/launchd mode (connect with
 # `sudo socat -,raw,echo=0 UNIX-CONNECT:/tmp/qemu-serial.sock`)
 SERIAL_SOCKET="/tmp/qemu-serial.sock"
+# How long --stopd/--restartd wait for the guest to power off after pressing
+# its power button (override with --timeout SECONDS). A hung guest otherwise
+# keeps them waiting forever.
+STOP_TIMEOUT_S=120
+# QEMU's own output in daemon mode (errors when it fails to start)
+QEMU_LOG="$SCRIPTPATH/qemu.log"
+# How long to wait at boot for the bridged interface to appear
+ETH_WAIT_S=30
 # What to do with an overlay left by a previous session, without asking:
 # commit | reuse | discard (set with --overlay; empty = ask)
 OVERLAY_CHOICE=""
@@ -89,6 +97,40 @@ QEMU_ARGS=(
 
 
 # --- Functionality ------------------------------------------------------------
+# Run a command as root: directly when already root, else through sudo. Without
+# a terminal sudo can't ask for a password, so -n makes it fail instead of hang.
+as_root() \
+{
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  elif [ -t 0 ]; then
+    sudo "$@"
+  else
+    sudo -n "$@"
+  fi
+}
+
+# Disk files belong to the owner of this directory even when the script runs as
+# root (launchd, sudo): otherwise later commits by that user need sudo.
+DISK_OWNER=$(stat -f %Su "$SCRIPTPATH")
+give_to_owner() \
+{
+  if [ "$(id -u)" -eq 0 ]; then
+    chown "$DISK_OWNER" "$@" 2>/dev/null || true
+  fi
+}
+
+# A fresh, empty overlay on the base disk. CREATED_OVERLAY tells run_daemon it
+# may remove it again if QEMU fails to start (it holds nothing yet).
+CREATED_OVERLAY=0
+new_overlay() \
+{
+  rm -f "$UNCLEAN_MARKER"
+  qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
+  give_to_owner "$OVERLAY_DISK_PATH"
+  CREATED_OVERLAY=1
+}
+
 # Rename disks from older release-specific names (e.g. ubuntu24-aarch64-base.qcow2)
 # to the current names, repointing overlays at the renamed base. If a VM is running,
 # keep using the legacy paths for this invocation so stop/commit still work.
@@ -172,13 +214,13 @@ create_or_reuse_overlay() \
         fi
         case "$OVERLAY_CHOICE" in
           c|C|commit)
-            commit_overlay
-            qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
+            commit_overlay || exit 1
+            new_overlay
             ;;
           d|D|discard)
             echo "Discarding overlay..."
             rm -f "$OVERLAY_DISK_PATH"
-            qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
+            new_overlay
             ;;
           *)
             echo "Reusing existing overlay."
@@ -189,17 +231,17 @@ create_or_reuse_overlay() \
         echo "WARNING: Uncommitted overlay detected from a previous session. Saving backup and discarding."
         mv -f "$OVERLAY_DISK_PATH" "$OVERLAY_DISK_BACKUP_PATH" 2>/dev/null \
           || { echo "WARNING: Could not save backup; discarding overlay."; rm -f "$OVERLAY_DISK_PATH"; }
-        qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
+        new_overlay
       fi
     else
       echo "Overlay corrupted. Saving backup and creating new overlay."
       mv -f "$OVERLAY_DISK_PATH" "$OVERLAY_DISK_BACKUP_PATH" 2>/dev/null \
         || { echo "WARNING: Could not save backup; discarding overlay."; rm -f "$OVERLAY_DISK_PATH"; }
-      qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
+      new_overlay
     fi
   else
     echo "Creating new overlay for this session..."
-    qemu-img create -f qcow2 -b "$BASE_DISK_PATH" -F qcow2 "$OVERLAY_DISK_PATH"
+    new_overlay
   fi
 
   # Add to QEMU_ARGS dynamically
@@ -277,6 +319,18 @@ add_usb_devices() \
 
 add_networking() \
 {
+  # At boot (launchd) the interface may not exist yet; QEMU fails without it
+  local waited=0
+  until ifconfig "$ETH_IFACE" >/dev/null 2>&1; do
+    if [ "$waited" -ge "$ETH_WAIT_S" ]; then
+      echo "WARNING: $ETH_IFACE still missing after ${ETH_WAIT_S}s; starting anyway." >&2
+      break
+    fi
+    [ "$waited" -eq 0 ] && echo "Waiting for $ETH_IFACE..."
+    sleep 1
+    waited=$((waited + 1))
+  done
+
   # Always bridge the ethernet interface so the VM is visible on the LAN
   QEMU_ARGS+=( -netdev "vmnet-bridged,id=net0,ifname=$ETH_IFACE" )
   QEMU_ARGS+=( -device "virtio-net-pci,netdev=net0,mac=$MAC_BRIDGE" )
@@ -319,34 +373,65 @@ restore_base() \
   fi
   echo "Restoring base disk from backup..."
   copy_with_progress "$BASE_DISK_BACKUP_PATH" "$BASE_DISK_PATH"
-  rm -f "$OVERLAY_DISK_PATH"
+  rm -f "$OVERLAY_DISK_PATH" "$UNCLEAN_MARKER"
   echo "Restore complete. Previous overlay discarded."
 }
 
+# Returns 1 if the commit fails (the overlay is kept for manual recovery).
 commit_overlay() \
 {
-  if [ -f "$OVERLAY_DISK_PATH" ]; then
-    echo "Committing overlay to base..."
-    if qemu-img commit "$OVERLAY_DISK_PATH"; then
-      echo "Overlay committed successfully."
-      rm -f "$OVERLAY_DISK_PATH"
-    else
-      echo "Warning: commit failed; overlay preserved for manual recovery."
-    fi
+  [ -f "$OVERLAY_DISK_PATH" ] || return 0
+  if [ -f "$UNCLEAN_MARKER" ]; then
+    echo "WARNING: this overlay is from a VM that was force-stopped: the guest"
+    echo "didn't shut down, so files written just before may be incomplete."
+  fi
+  echo "Committing overlay to base..."
+  local status=0
+  # Files made by an older root-run start aren't writable by us: commit as root
+  if [ -w "$OVERLAY_DISK_PATH" ] && [ -w "$BASE_DISK_PATH" ]; then
+    qemu-img commit "$OVERLAY_DISK_PATH" || status=$?
+  else
+    echo "The disk files aren't writable by $(id -un): committing as root."
+    as_root qemu-img commit "$OVERLAY_DISK_PATH" || status=$?
+  fi
+  if [ "$status" -eq 0 ]; then
+    echo "Overlay committed successfully."
+    rm -f "$OVERLAY_DISK_PATH" "$UNCLEAN_MARKER"
+  else
+    echo "ERROR: commit failed; the overlay is kept for manual recovery." >&2
+    return 1
   fi
 }
 
+qemu_pids() \
+{
+  ps aux | grep '[q]emu-system-aarch64' | awk '{print $2}' || true
+}
+
+# QEMU runs as root, so killing it takes root too.
 killall() \
 {
-  PIDS=$(ps aux | grep '[q]emu-system-aarch64' | awk '{print $2}' || true)
-  if [ -n "$PIDS" ]; then
-    echo -e "Killing PID(s): \n$PIDS"
-    kill -9 $PIDS
-    exit 0
-  else
+  PIDS=$(qemu_pids)
+  if [ -z "$PIDS" ]; then
     echo "No VM processes detected."
     exit 1
   fi
+  echo "Killing PID(s):" $PIDS
+  as_root kill -9 $PIDS || true
+  sleep 1
+  if [ -n "$(qemu_pids)" ]; then
+    echo "ERROR: the VM is still running: could not kill it as root" >&2
+    echo "(passwordless sudo is needed without a terminal)." >&2
+    exit 1
+  fi
+  echo "VM killed."
+  if [ -f "$OVERLAY_DISK_PATH" ]; then
+    touch "$UNCLEAN_MARKER"
+    give_to_owner "$UNCLEAN_MARKER"
+    echo "Its overlay is marked unclean: the guest didn't shut down, so check"
+    echo "the VM before committing it (or discard it)."
+  fi
+  exit 0
 }
 
 
@@ -361,7 +446,7 @@ run_terminal() \
   
   sudo qemu-system-aarch64 "${QEMU_ARGS[@]}"
 
-  commit_overlay
+  commit_overlay || exit 1
 }
 
 # Without a terminal, sudo can't ask for a password: fail clearly instead of
@@ -381,17 +466,24 @@ run_daemon() \
   QEMU_ARGS+=(-display none -serial "unix:${SERIAL_SOCKET},server,nowait")
 
   echo "--- RUNNING QEMU (DAEMON) ---"
-  echo "nohup qemu-system-aarch64 ${QEMU_ARGS[@]} >/dev/null 2>&1 &"
+  echo "nohup qemu-system-aarch64 ${QEMU_ARGS[@]} >$QEMU_LOG 2>&1 &"
   echo "-----------------------------"
   check_sudo
-  nohup sudo qemu-system-aarch64 "${QEMU_ARGS[@]}" >/dev/null 2>&1 &
+  nohup sudo qemu-system-aarch64 "${QEMU_ARGS[@]}" >"$QEMU_LOG" 2>&1 &
+  give_to_owner "$QEMU_LOG"
 
   # QEMU fails fast on bad arguments or missing permissions: report it.
   sleep 3
   if pgrep -f "qemu-system-aarch64.*${OVERLAY_DISK_PATH}" >/dev/null; then
     echo "VM started. Serial console: ${SERIAL_SOCKET}"
   else
-    echo "ERROR: QEMU exited right away. Run with --term to see why." >&2
+    echo "ERROR: QEMU exited right away. Its output ($QEMU_LOG):" >&2
+    tail -n 20 "$QEMU_LOG" >&2 || true
+    # An overlay made by this start holds nothing yet: don't leave it behind
+    if [ "$CREATED_OVERLAY" -eq 1 ]; then
+      rm -f "$OVERLAY_DISK_PATH"
+      echo "Removed the empty overlay this start created." >&2
+    fi
     exit 1
   fi
 }
@@ -406,24 +498,47 @@ run_launchd() \
 
   qemu-system-aarch64 "${QEMU_ARGS[@]}"
 
-  commit_overlay
+  commit_overlay || exit 1
 }
 
+# Press the guest's power button, wait (at most STOP_TIMEOUT_S) for it to power
+# off, then commit its overlay. Exits 2 on a timeout: the VM is still running.
 run_shutdown() \
 {
-  if [ -S "$MONITOR_SOCKET" ]; then
-    echo "system_powerdown" | sudo socat - UNIX-CONNECT:"$MONITOR_SOCKET" || true
-
-    # Wait until QEMU process using this overlay exits
-    echo "Waiting for VM to exit..."
-    while pgrep -f "qemu-system-aarch64.*${OVERLAY_DISK_PATH}" >/dev/null; do
-      sleep 1
-    done
-
-    commit_overlay
-  else
-    echo "No monitor socket found ($MONITOR_SOCKET)"
+  if ! pgrep -f "qemu-system-aarch64.*${OVERLAY_DISK_PATH}" >/dev/null; then
+    echo "The VM isn't running."
+    return 0
   fi
+  if [ ! -S "$MONITOR_SOCKET" ]; then
+    echo "ERROR: the VM is running but its monitor socket ($MONITOR_SOCKET) is" >&2
+    echo "missing, so it can't be shut down cleanly. Force it with --fkilld." >&2
+    exit 1
+  fi
+  echo "Pressing the VM's power button..."
+  if ! echo "system_powerdown" | as_root socat - UNIX-CONNECT:"$MONITOR_SOCKET" >/dev/null; then
+    echo "ERROR: could not reach the VM's monitor (as root: passwordless sudo is" >&2
+    echo "needed without a terminal)." >&2
+    exit 1
+  fi
+
+  echo "Waiting up to ${STOP_TIMEOUT_S}s for the guest to power off..."
+  local waited=0
+  while pgrep -f "qemu-system-aarch64.*${OVERLAY_DISK_PATH}" >/dev/null; do
+    if [ "$waited" -ge "$STOP_TIMEOUT_S" ]; then
+      echo "ERROR: the guest didn't power off within ${STOP_TIMEOUT_S}s: it may be hung" >&2
+      echo "or ignoring the power button. Shut it down from inside (sudo poweroff)," >&2
+      echo "or force it with --fkilld." >&2
+      exit 2
+    fi
+    sleep 1
+    waited=$((waited + 1))
+    if [ $((waited % 15)) -eq 0 ]; then
+      echo "  still running after ${waited}s..."
+    fi
+  done
+  echo "VM powered off after ${waited}s."
+
+  commit_overlay || exit 1
 }
 
 
@@ -436,6 +551,8 @@ usage() \
     "\n --wifi | -w  : Enable Wi-Fi sharing (vmnet-shared)."\
     "\n --overlay X  : With --startd/--restartd/--term, what to do with an overlay left by"\
     "\n                a previous session, without asking: commit, reuse or discard."\
+    "\n --timeout N  : With --stopd/--restartd, seconds to wait for the guest to power"\
+    "\n                off (default ${STOP_TIMEOUT_S}); after that, give up with exit code 2."\
     "\n --term       : Run the VM attached to the current terminal session."\
     "\n --startd     : Run the VM as a headless daemon."\
     "\n --stopd      : Attempt to shutdown a headless daemon VM."\
@@ -465,6 +582,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --term | --startd | --stopd | --restartd | --fkilld | --clean | --launchd | --backup | --restore | --status) MODE="$1"; shift ;;
     -w | --wifi) NET_MODE="wifi"; shift ;;
+    --timeout)
+      case "${2:-}" in
+        '' | *[!0-9]*) echo "ERROR: --timeout takes a number of seconds" >&2; exit 1 ;;
+        *) STOP_TIMEOUT_S="$2"; shift 2 ;;
+      esac
+      ;;
     --overlay)
       case "${2:-}" in
         commit | reuse | discard) OVERLAY_CHOICE="$2"; shift 2 ;;
@@ -476,6 +599,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 migrate_legacy_disks
+# Marks an overlay a force stop left behind (after migration fixes the paths)
+UNCLEAN_MARKER="${OVERLAY_DISK_PATH}.unclean"
 
 if [ ! -f "$BASE_DISK_PATH" ]; then
   # Never launch the interactive installer from launchd
@@ -518,7 +643,7 @@ else
       run_shutdown
       ;;
     --restartd)
-      # Call shutdown then start daemon
+      # Call shutdown then start daemon (run_shutdown exits if it times out)
       run_shutdown
       add_networking
       add_usb_devices
@@ -544,7 +669,10 @@ else
       ;;
     --clean)
       verify_not_running
-      commit_overlay
+      if [ ! -f "$OVERLAY_DISK_PATH" ]; then
+        echo "No overlay to commit."
+      fi
+      commit_overlay || exit 1
       ;;
     --backup)
       backup_base
