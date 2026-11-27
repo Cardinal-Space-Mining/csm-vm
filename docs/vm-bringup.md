@@ -129,8 +129,27 @@ Finally, disable networkd and apply the netplan config:
     nmcli c
     ```
 
-> [!CAUTION]
-> There is an issue with Ubuntu/Linux where configuring netplan a certain way and then removing adapters when rebooting will cause a ~90 second delay when booting. There is currently no easy way to fix this for all setups. This will cause issus when setting up the VM with ethernet attached but later using the `--wifi` flag, or setting up external wifi adapters and then removing them. The best mitigation at this point in time is to ensure the VM is always started with the same networking setup, and otherwise taking note that this behavior is expected.
+> [!NOTE]
+> Boot waits for the network to be "online" (`NetworkManager-wait-online`), which by default means every
+> configured connection: an adapter that is missing, or Ethernet with no DHCP server on it (no robot router,
+> no internet sharing), held boot for 60-90 s. netplan's `optional: true` doesn't help here (it only applies
+> to systemd-networkd, and this VM uses NetworkManager). Cap the wait instead; nothing on the VM needs every
+> link up, and slow links keep connecting in the background:
+> ```bash
+> sudo mkdir -p /etc/systemd/system/NetworkManager-wait-online.service.d
+> printf '[Service]\nEnvironment=NM_ONLINE_TIMEOUT=10\n' | \
+>     sudo tee /etc/systemd/system/NetworkManager-wait-online.service.d/short-timeout.conf
+> sudo systemctl daemon-reload
+> ```
+
+### Unattended Boots
+The VM runs headless, so nobody can pick a GRUB entry. After a boot that didn't finish (the VM was killed,
+force-stopped, or lost power), Ubuntu's GRUB waits 30 s at its hidden menu ("recordfail"). Turn that off:
+```bash
+echo 'GRUB_RECORDFAIL_TIMEOUT=0' | sudo tee /etc/default/grub.d/99-no-recordfail-wait.cfg
+sudo update-grub
+```
+Then shut the VM down cleanly (`./run-vm.sh --stopd`) so both changes are committed to the base disk.
 
 ### Networking Debug
 * To view all available network adapters:

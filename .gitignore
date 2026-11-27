@@ -2,5 +2,12 @@
 *.raw
 *.qcow2
 *.backup
-test*
+/test*
+# (but not the tests)
+!/tests/
+!/tests/*
 machine.conf
+qemu.log
+*.unclean
+*.lock
+*.recovered

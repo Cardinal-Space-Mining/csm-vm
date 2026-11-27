@@ -56,6 +56,19 @@ The `CPUS`, `RAM`, `ETH_IFACE`, `MAC`, and `USB_WHITELIST` variables may be spec
     ./run-vm.sh --stopd
     ```
 
+### Script files and tests
+`run-vm.sh` holds the configuration, the options and what each one does; the functions it uses are in `lib/`, which must stay next to it:
+
+| File | What it holds |
+|---|---|
+| `lib/common.sh` | Running commands as root, who owns the disk files, whether the VM is running |
+| `lib/overlay.sh` | The base disk and its overlay: creating, reusing, committing (one commit at a time), backup and restore |
+| `lib/saved.sh` | Saved sessions: saving, pruning, recovering and deleting them, and keeping them intact when another overlay is committed |
+| `lib/qemu.sh` | QEMU's arguments: the machine, the installer ISO, USB devices and networking |
+| `lib/modes.sh` | Running the VM (terminal, daemon, launchd) and stopping it (power button, force kill) |
+
+`./tests/test-disks.sh` checks the disk handling (commits, saved sessions, recovery, the commit lock) on small made-up disk images in a temporary folder. It never starts a VM or touches the real disks, so it is safe to run while the VM is up. Run it after changing anything in `lib/overlay.sh` or `lib/saved.sh`.
+
 ### Script Autostart
 * Use the `autostart.sh` script to initalize the VM to be run on system startup by creating a LaunchDaemon:
     ```bash
@@ -65,6 +78,27 @@ The `CPUS`, `RAM`, `ETH_IFACE`, `MAC`, and `USB_WHITELIST` variables may be spec
     ```bash
     sudo ./autostart.sh --uninstall
     ```
+
+### Power cuts and saved sessions
+Changes made in the VM live in its overlay until it's committed into the base disk, which happens when the VM
+shuts down cleanly (`--stopd`, or `sudo poweroff` inside it). A power cut or e-stop leaves the overlay behind
+uncommitted, possibly with logs worth keeping. Nothing is thrown away:
+* Started from Orca or with `--startd`, you choose: **reuse** it (boots that session again, like a computer
+  after a power cut), commit it, or discard it.
+* At boot with autostart (`--launchd`), it's kept as `ubuntu-aarch64-overlay.saved-<when it was last
+  written>.qcow2` and the VM boots the base disk (`LAUNCHD_OVERLAY=reuse` in `machine.conf` boots straight
+  back into it instead). The newest `SAVED_OVERLAYS_KEPT` (5) are kept, and commits keep them readable.
+
+To get at a saved session (Orca: the mac's VM → Saved sessions → Recover):
+```bash
+./run-vm.sh --list-saved
+./run-vm.sh --recover ubuntu-aarch64-overlay.saved-20261126-231450.qcow2
+./run-vm.sh --startd --overlay reuse      # boots that session: copy what you need
+./run-vm.sh --stopd                       # a recovered session isn't committed on stop
+./run-vm.sh --clean                       # only if this session should become the base disk
+```
+Then start with `--overlay discard` to go back to the base disk, and `--forget <file>` a saved session you no
+longer need.
 
 ### Upgrading Ubuntu releases
 The disk files are named without a release number (`ubuntu-aarch64-base.qcow2`), since the release can change inside the VM. Disks from older versions of this script (`ubuntu24-aarch64-*.qcow2`) are renamed automatically the next time the script runs with the VM stopped. Pulling this repo doesn't change which Ubuntu release an existing VM runs.

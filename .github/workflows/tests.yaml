@@ -1,0 +1,32 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+    paths: ['run-vm.sh', 'lib/**', 'tests/**', '.github/workflows/tests.yaml']
+  pull_request:
+    branches: [main]
+    paths: ['run-vm.sh', 'lib/**', 'tests/**', '.github/workflows/tests.yaml']
+  workflow_dispatch:
+
+jobs:
+  # run-vm.sh's disk handling (commits, saved sessions, recovery, the commit
+  # lock) on small made-up disk images. It uses macOS's tools (BSD stat,
+  # bash 3.2), so it runs on a mac; no VM is started.
+  disks:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout csm-vm
+        uses: actions/checkout@v6
+
+      - name: Install QEMU
+        run: brew install qemu
+
+      - name: Check script syntax
+        run: |
+          for file in run-vm.sh autostart.sh vm-status.sh lib/*.sh tests/*.sh; do
+            /bin/bash -n "$file"
+          done
+
+      - name: Run disk tests
+        run: /bin/bash tests/test-disks.sh
