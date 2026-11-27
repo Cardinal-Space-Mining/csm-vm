@@ -56,6 +56,19 @@ The `CPUS`, `RAM`, `ETH_IFACE`, `MAC`, and `USB_WHITELIST` variables may be spec
     ./run-vm.sh --stopd
     ```
 
+### Script files and tests
+`run-vm.sh` holds the configuration, the options and what each one does; the functions it uses are in `lib/`, which must stay next to it:
+
+| File | What it holds |
+|---|---|
+| `lib/common.sh` | Running commands as root, who owns the disk files, whether the VM is running |
+| `lib/overlay.sh` | The base disk and its overlay: creating, reusing, committing (one commit at a time), backup and restore |
+| `lib/saved.sh` | Saved sessions: saving, pruning, recovering and deleting them, and keeping them intact when another overlay is committed |
+| `lib/qemu.sh` | QEMU's arguments: the machine, the installer ISO, USB devices and networking |
+| `lib/modes.sh` | Running the VM (terminal, daemon, launchd) and stopping it (power button, force kill) |
+
+`./tests/test-disks.sh` checks the disk handling (commits, saved sessions, recovery, the commit lock) on small made-up disk images in a temporary folder. It never starts a VM or touches the real disks, so it is safe to run while the VM is up. Run it after changing anything in `lib/overlay.sh` or `lib/saved.sh`.
+
 ### Script Autostart
 * Use the `autostart.sh` script to initalize the VM to be run on system startup by creating a LaunchDaemon:
     ```bash
